@@ -10,7 +10,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.24.0",
     "@modelcontextprotocol/sdk": "^1.20.1",
     "@supabase/supabase-js": "^2.46.1",
     "agents": "^0.2.14",
@@ -18,7 +17,6 @@
     "dotenv": "^17.2.3",
     "mcp-framework": "^0.2.15",
     "node-fetch": "^3.3.2",
-    "openai": "^4.91.1",
     "@anthropic-ai/sdk": "^0.27.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

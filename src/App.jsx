@@ -3,7 +3,8 @@ import { AuthProvider, useAuth } from "./context/AuthContext";
 import { McpServersProvider, useMcpServers } from "./context/McpServersContext";
 import ServerManager from "./components/MCPServers/ServerManager";
 import ToolInvoker from "./components/MCPServers/ToolInvoker";
-import { Assistant as AnthropicAssistant } from "./assistants/anthropic";
+import { Assistant as AnthropicAssistant } from "./assistants/anthropic"; // kept for direct calls if needed
+import { runAnthropicStream } from "./assistants/anthropicStreamClient.js";
 import { Loader } from "./components/Loader/Loader";
 import { Chat } from "./components/Chat/Chat";
 import { Controls } from "./components/Controls/Controls";
@@ -24,90 +25,47 @@ function AppInner() {
   }
 
   async function handleContentSend(content) {
-    const SHOW_TOOL_STEPS = false; // set true to debug tool I/O in the chat
-
+    const SHOW_TOOL_STEPS = false; // toggle to surface tool step summary as a single message
     addMessage({ content, role: "user" });
     setIsLoading(true);
-    setPendingSteps([]);
     setIsStreaming(true);
-
+    setPendingSteps([]);
+    let assistantIdxRef = -1;
+    const stepsLocal = [];
     try {
-      const stream = assistant.chatStreamToolAware(content, {
+      await runAnthropicStream({
+        prompt: content,
         forceEnableTools: true,
-      });
-
-      const steps = []; // <— local accumulator to avoid stale state reads
-      let assistantIdxRef = -1; // <— stable index for the first assistant message
-      let sawAssistantText = false;
-
-      for await (const evt of stream) {
-        if (evt.type === "assistant_text") {
-          if (assistantIdxRef === -1) {
-            // insert the first assistant message and remember its index
-            setMessages((prev) => {
-              assistantIdxRef = prev.length + 1; // +1 because we already pushed the user message
-              return [...prev, { role: "assistant", content: evt.text }];
-            });
-          } else {
-            // append to the same assistant message
-            setMessages((prev) =>
-              prev.map((m, i) =>
-                i === assistantIdxRef
-                  ? { ...m, content: m.content + evt.text }
-                  : m
-              )
-            );
-          }
-          sawAssistantText = true;
-        } else if (
-          evt.type === "tool_use" ||
-          evt.type === "tool_result" ||
-          evt.type === "tool_error"
-        ) {
-          steps.push(evt); // <— keep locally
-          setPendingSteps((prev) => [...prev, evt]); // optional, if you still want to expose state
-        } else if (evt.type === "error") {
-          addMessage({ role: "system", content: "Error: " + evt.error });
-        } else if (evt.type === "done") {
-          if (SHOW_TOOL_STEPS && steps.length) {
-            const stepSummary = steps
-              .map((s) => {
-                if (s.type === "tool_use")
-                  return `→ Using ${s.tool} ${JSON.stringify(s.args)}`;
-                if (s.type === "tool_result") {
-                  let hint = "";
-                  try {
-                    const obj = JSON.parse(s.output);
-                    const status = obj?.status ?? obj?.contentType ?? "";
-                    if (status) hint = ` (${status})`;
-                  } catch {}
-                  return `✔ ${s.tool} finished${hint}`;
-                }
-                if (s.type === "tool_error")
-                  return `✖ Error in ${s.tool}: ${s.error}`;
-                return "";
-              })
-              .join("\n");
-            addMessage({ role: "tool", content: stepSummary });
+        onEvent: (evt) => {
+          if (evt.type === 'assistant_text') {
+            if (assistantIdxRef === -1) {
+              setMessages(prev => {
+                assistantIdxRef = prev.length; // index of new assistant message
+                return [...prev, { role: 'assistant', content: evt.text }];
+              });
+            } else {
+              setMessages(prev => prev.map((m,i)=> i===assistantIdxRef ? { ...m, content: m.content + evt.text } : m));
+            }
+          } else if (evt.type === 'tool_use' || evt.type === 'tool_result' || evt.type === 'tool_error') {
+            stepsLocal.push(evt);
+            setPendingSteps(prev => [...prev, evt]);
+          } else if (evt.type === 'error') {
+            addMessage({ role: 'system', content: 'Error: ' + evt.error });
+          } else if (evt.type === 'done') {
+            if (SHOW_TOOL_STEPS && stepsLocal.length) {
+              const stepSummary = stepsLocal.map(s => {
+                if (s.type === 'tool_use') return `→ Using ${s.tool} ${JSON.stringify(s.args)}`;
+                if (s.type === 'tool_result') return `✔ ${s.tool} finished`;
+                if (s.type === 'tool_error') return `✖ Error in ${s.tool}: ${s.error}`;
+                return '';
+              }).join('\n');
+              addMessage({ role: 'tool', content: stepSummary });
+            }
           }
         }
-      }
-
-      if (!sawAssistantText) {
-        // fallback if the SSE path produced no assistant text
-        const fallbackText = await assistant.chat(content);
-        addMessage({
-          role: "assistant",
-          content: fallbackText || "[No response generated]",
-        });
-      }
-    } catch (error) {
-      addMessage({
-        role: "system",
-        content:
-          "Sorry, I couldn't process your request. Error: " + error.message,
       });
-      console.error("Chat Error: ", error);
+    } catch (e) {
+      addMessage({ role: 'system', content: 'Sorry, I could not process your request. ' + String(e?.message || e) });
     } finally {
       setIsLoading(false);
       setIsStreaming(false);
