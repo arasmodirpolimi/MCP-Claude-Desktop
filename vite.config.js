@@ -11,7 +11,9 @@ export default defineConfig({
   server: {
     proxy: {
       "/mcp": { target: "http://localhost:3100", changeOrigin: true },
-      "/anthropic": { target: "http://localhost:3100", changeOrigin: true }
+      "/anthropic": { target: "http://localhost:3100", changeOrigin: true },
+      "/api": { target: "http://localhost:3100", changeOrigin: true },
+      "/admin": { target: "http://localhost:3100", changeOrigin: true }
     }
   },
 });

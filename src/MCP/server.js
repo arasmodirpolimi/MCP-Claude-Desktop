@@ -6,7 +6,7 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { registerTools, TOOL_DEFS, addTool, removeTool, buildAnthropicTools, getCurrentWeatherFn } from "./registerTools.js";
+import { registerTools, TOOL_DEFS, addTool, removeTool, buildAnthropicTools, getCurrentWeatherFn, getToolUsageLog } from "./registerTools.js";
 import { z } from 'zod';
 import cors from "cors";
 
@@ -505,6 +505,16 @@ app.delete('/admin/tools/:name', (req, res) => {
   if (!name) return res.status(400).json({ error: 'Missing name' });
   const ok = removeTool(name);
   return res.json({ ok, removed: name });
+});
+
+// Tool usage log endpoint (in-memory; resets on server restart)
+app.get('/admin/tools/usage', (req, res) => {
+  try {
+    const log = getToolUsageLog();
+    return res.json({ entries: log.slice(-200) }); // cap size
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
 });
 
 // Optional export for serverless adapters or test harnesses

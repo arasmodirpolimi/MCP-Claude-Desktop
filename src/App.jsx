@@ -3,6 +3,7 @@ import { AuthProvider, useAuth } from "./context/AuthContext";
 import { McpServersProvider, useMcpServers } from "./context/McpServersContext";
 import ServerManager from "./components/MCPServers/ServerManager";
 import ToolInvoker from "./components/MCPServers/ToolInvoker";
+import ToolLog from "./components/ToolLog/ToolLog";
 import { Assistant as AnthropicAssistant } from "./assistants/anthropic"; // kept for direct calls if needed
 import { runAnthropicStream } from "./assistants/anthropicStreamClient.js";
 import { Loader } from "./components/Loader/Loader";
@@ -24,7 +25,9 @@ function AppInner() {
     setMessages((prevMessages) => [...prevMessages, message]);
   }
 
-  async function handleContentSend(content) {
+  const [currentModel, setCurrentModel] = useState('');
+
+  async function handleContentSend(content, opts = {}) {
     const SHOW_TOOL_STEPS = false; // toggle to surface tool step summary as a single message
     addMessage({ content, role: "user" });
     setIsLoading(true);
@@ -35,7 +38,8 @@ function AppInner() {
     try {
       await runAnthropicStream({
         prompt: content,
-        forceEnableTools: true,
+        model: opts.model,
+        forceEnableTools: opts.enableTools,
         onEvent: (evt) => {
           if (evt.type === 'assistant_text') {
             if (assistantIdxRef === -1) {
@@ -46,6 +50,8 @@ function AppInner() {
             } else {
               setMessages(prev => prev.map((m,i)=> i===assistantIdxRef ? { ...m, content: m.content + evt.text } : m));
             }
+          } else if (evt.type === 'model_used') {
+            setCurrentModel(evt.model || opts.model || '');
           } else if (evt.type === 'tool_use' || evt.type === 'tool_result' || evt.type === 'tool_error') {
             stepsLocal.push(evt);
             setPendingSteps(prev => [...prev, evt]);
@@ -242,6 +248,11 @@ function AppInner() {
             alt="Chatbot Logo"
           />
           <h2 className={styles.Title}>AI Chatbot</h2>
+          {currentModel && (
+            <span style={{ marginLeft:'0.75rem', fontSize:'0.65rem', padding:'2px 6px', background:'#222', border:'1px solid #333', borderRadius:6, color:'#aaa' }}>
+              Model: {currentModel}
+            </span>
+          )}
         </div>
         <button onClick={handleLogout} className={styles.LogoutButton}>
           Logout
@@ -260,6 +271,7 @@ function AppInner() {
         <div style={{ overflowY: "auto", maxHeight: "85vh" }}>
           <ServerManager />
           <ToolInvoker onResult={handleToolResult} />
+          <ToolLog />
         </div>
 
         <div className={styles.ChatContainer}>

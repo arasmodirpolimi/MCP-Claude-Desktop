@@ -5,6 +5,8 @@ import styles from "./Controls.module.css";
 export function Controls( {isDisabled = false, onSend } ) {
   const textareaRef = useRef(null);
   const [content, setContent] = useState("");
+  const [selectedModel, setSelectedModel] = useState('claude-3-5-sonnet-latest');
+  const [enableTools, setEnableTools] = useState(true);
 
 
   useEffect(() => {
@@ -18,10 +20,9 @@ export function Controls( {isDisabled = false, onSend } ) {
   }
 
   function handleContentSend() {
-    if (content.length > 0) {
-      onSend(content)
-      setContent("")
-    }
+    if (content.trim().length === 0) return;
+    onSend(content, { model: selectedModel, enableTools });
+    setContent("");
   }
 
   function handleEnterPress(event) {
@@ -34,6 +35,25 @@ export function Controls( {isDisabled = false, onSend } ) {
 
   return (
     <div className={styles.Controls}>
+      <div style={{ display:'flex', gap:'0.5rem', alignItems:'center', flexWrap:'wrap', marginBottom:'0.4rem' }}>
+        <label style={{ display:'flex', flexDirection:'column', fontSize:'0.65rem', color:'#ccc' }}>
+          <span style={{ marginBottom:2 }}>Model</span>
+          <select
+            value={selectedModel}
+            onChange={e=>setSelectedModel(e.target.value)}
+            disabled={isDisabled}
+            style={{ padding:'0.35rem 0.5rem', background:'#222', color:'#eee', border:'1px solid #444', borderRadius:4, fontSize:'0.75rem' }}
+          >
+            <option value="claude-3-5-sonnet-latest">Sonnet</option>
+            <option value="claude-3-5-haiku-latest">Haiku</option>
+            <option value="claude-3-opus-latest">Opus</option>
+          </select>
+        </label>
+        <label style={{ display:'flex', alignItems:'center', gap:6, fontSize:'0.7rem', color:'#ccc' }}>
+          <input type="checkbox" checked={enableTools} disabled={isDisabled} onChange={e=>setEnableTools(e.target.checked)} />
+          Use tools
+        </label>
+      </div>
       <div className={styles.TextAreaContainer}>
         <TextareaAutosize
           className={styles.TextArea}

@@ -7,7 +7,16 @@ import React, { createContext, useContext, useEffect, useState, useCallback } fr
 const McpServersContext = createContext(null);
 
 export function McpServersProvider({ children }) {
-  const [servers, setServers] = useState([]); // [{id,name,baseUrl,createdAt}]
+  const [servers, setServers] = useState(() => {
+    try {
+      const raw = localStorage.getItem('mcp_servers');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed.filter(s => s && typeof s.id === 'string');
+      }
+    } catch {}
+    return [];
+  }); // [{id,name,baseUrl,createdAt}]
   const [activeServerId, setActiveServerId] = useState(null);
   const [toolsByServer, setToolsByServer] = useState({}); // serverId -> tools array
   const [enabledToolsByServer, setEnabledToolsByServer] = useState(() => {
@@ -39,11 +48,16 @@ export function McpServersProvider({ children }) {
     try {
       const resp = await fetch(buildUrl('/api/mcp/servers'));
       if (!resp.ok) throw new Error(`List servers failed ${resp.status}`);
-      const data = await resp.json();
+      const text = await resp.text();
+      if (/^\s*<!doctype/i.test(text) || /^\s*<html/i.test(text)) {
+        throw new Error('Server returned HTML instead of JSON for /api/mcp/servers');
+      }
+      let data; try { data = JSON.parse(text); } catch { throw new Error('Invalid JSON returned for /api/mcp/servers'); }
       // Sanitize server list: ensure each entry is an object with an id
       const raw = data.servers || [];
       const cleaned = Array.isArray(raw) ? raw.filter(s => s && typeof s.id === 'string') : [];
       setServers(cleaned);
+      try { localStorage.setItem('mcp_servers', JSON.stringify(cleaned)); } catch {}
       if (!activeServerId && cleaned.length) setActiveServerId(cleaned[0].id);
     } catch (e) { setError(String(e.message || e)); }
     finally { setLoadingServers(false); }
@@ -55,12 +69,18 @@ export function McpServersProvider({ children }) {
     setError(null);
     const resp = await fetch(buildUrl('/api/mcp/servers'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, baseUrl }) });
     if (!resp.ok) throw new Error(`Add server failed ${resp.status}`);
-    const data = await resp.json();
+    const text = await resp.text();
+    if (/^\s*<!doctype/i.test(text)) throw new Error('HTML response (proxy misconfiguration) adding server');
+    let data; try { data = JSON.parse(text); } catch { throw new Error('Invalid JSON adding server'); }
     // Validate returned server shape before mutating state
     if (!data || !data.server || typeof data.server.id !== 'string') {
       throw new Error('Invalid server returned from registry');
     }
-    setServers(s => [...s, data.server]);
+    setServers(s => {
+      const next = [...s, data.server];
+      try { localStorage.setItem('mcp_servers', JSON.stringify(next)); } catch {}
+      return next;
+    });
     setActiveServerId(data.server.id);
     return data.server;
   }, []);
@@ -68,7 +88,11 @@ export function McpServersProvider({ children }) {
   const removeServer = useCallback(async (id) => {
     const resp = await fetch(buildUrl(`/api/mcp/servers/${id}`), { method: 'DELETE' });
     if (!resp.ok) throw new Error(`Remove server failed ${resp.status}`);
-    setServers(s => s.filter(x => x.id !== id));
+    setServers(s => {
+      const next = s.filter(x => x.id !== id);
+      try { localStorage.setItem('mcp_servers', JSON.stringify(next)); } catch {}
+      return next;
+    });
     setToolsByServer(m => { const clone = { ...m }; delete clone[id]; return clone; });
     if (activeServerId === id) setActiveServerId(null);
   }, [activeServerId]);
@@ -78,8 +102,50 @@ export function McpServersProvider({ children }) {
     setLoadingTools(true); setError(null);
     try {
       const resp = await fetch(buildUrl(`/api/mcp/servers/${id}/tools`));
+      if (resp.status === 404) {
+        console.warn('[MCP] tools 404 for server id', id, '— attempting silent re-create');
+        const stale = servers.find(s => s.id === id);
+        if (stale) {
+          try {
+            const addResp = await fetch(buildUrl('/api/mcp/servers'), { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: stale.name, baseUrl: stale.baseUrl }) });
+            if (addResp.ok) {
+              const txt = await addResp.text();
+              let data; try { data = JSON.parse(txt); } catch {}
+              if (data?.server?.id) {
+                setServers(prev => {
+                  const filtered = prev.filter(s => s.id !== id);
+                  const next = [...filtered, data.server];
+                  try { localStorage.setItem('mcp_servers', JSON.stringify(next)); } catch {}
+                  return next;
+                });
+                setActiveServerId(data.server.id);
+                // Retry once
+                try {
+                  const retry = await fetch(buildUrl(`/api/mcp/servers/${data.server.id}/tools`));
+                  if (retry.ok) {
+                    const tText = await retry.text();
+                    if (/^\s*<!doctype/i.test(tText)) throw new Error('HTML response (proxy) when fetching tools');
+                    let tData; try { tData = JSON.parse(tText); } catch { throw new Error('Invalid JSON fetching tools'); }
+                    const tools = tData.tools || [];
+                    setToolsByServer(m => ({ ...m, [data.server.id]: tools }));
+                    return tools;
+                  }
+                } catch (retryErr) {
+                  console.warn('[MCP] retry after recreate failed', retryErr);
+                }
+              }
+            }
+          } catch (recreateErr) {
+            console.warn('[MCP] re-create failed', recreateErr);
+          }
+        }
+        // Silent failure: do not throw; just return undefined so UI doesn't show error banner
+        return;
+      }
       if (!resp.ok) throw new Error(`List tools failed ${resp.status}`);
-      const data = await resp.json();
+      const t = await resp.text();
+      if (/^\s*<!doctype/i.test(t)) throw new Error('HTML response (proxy) when fetching tools');
+      let data; try { data = JSON.parse(t); } catch { throw new Error('Invalid JSON fetching tools'); }
       const tools = data.tools || [];
       setToolsByServer(m => ({ ...m, [id]: tools }));
       // Persist enabled flags returned by backend into our enabledTools map
