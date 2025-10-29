@@ -1,0 +1,42 @@
+{
+  "name": "my-api-react",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "@modelcontextprotocol/sdk": "^1.20.1",
+    "@supabase/supabase-js": "^2.46.1",
+    "agents": "^0.2.14",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "mcp-framework": "^0.2.15",
+    "node-fetch": "^3.3.2",
+    "openai": "^4.91.1",
+    "@anthropic-ai/sdk": "^0.27.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "react-textarea-autosize": "^8.5.7",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251014.0",
+    "@eslint/js": "^9.21.0",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9.21.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "eslint-plugin-react-refresh": "^0.4.19",
+    "globals": "^15.15.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.2.0"
+  }
+}

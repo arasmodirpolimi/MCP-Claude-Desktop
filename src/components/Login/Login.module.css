@@ -1,0 +1,243 @@
+/* Animated gradient background + glass card + accessibility-focused styling */
+@keyframes gradientMove {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+@keyframes floatOrb {
+  0% { transform: translateY(0px) scale(1); }
+  50% { transform: translateY(-30px) scale(1.05); }
+  100% { transform: translateY(0px) scale(1); }
+}
+
+.Background {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(1rem, 3vw, 3rem);
+  background: linear-gradient(120deg, #0f0f1a, #121328, #1c2340, #232b55);
+  background-size: 300% 300%;
+  animation: gradientMove 18s ease infinite;
+  overflow: hidden;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  color: #e6e9f5;
+}
+
+.Noise {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1600' height='1600'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='1600' height='1600' filter='url(%23n)'/%3E%3C/svg%3E");
+  opacity: 0.04;
+  mix-blend-mode: overlay;
+}
+
+.OrbA, .OrbB {
+  position: absolute;
+  width: 420px;
+  height: 420px;
+  border-radius: 50%;
+  filter: blur(90px);
+  opacity: 0.35;
+  animation: floatOrb 16s ease-in-out infinite;
+}
+
+.OrbA { background: radial-gradient(circle at 30% 30%, #7f5af0, transparent); top: -100px; left: -120px; }
+.OrbB { background: radial-gradient(circle at 70% 70%, #2cb67d, transparent); bottom: -140px; right: -160px; animation-delay: 6s; }
+
+.Card {
+  position: relative;
+  width: 100%;
+  max-width: 420px;
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(18px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 18px 40px -10px rgba(0,0,0,0.6);
+  border-radius: 28px;
+  padding: clamp(1.75rem, 3.5vw, 2.75rem);
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+  isolation: isolate;
+}
+
+.Title {
+  margin: 0;
+  font-size: clamp(1.9rem, 4.2vw, 2.6rem);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  background: linear-gradient(90deg, #fff, #d1d5f9 45%, #9fa8ff);
+  -webkit-background-clip: text;
+  background-clip: text; /* standard property for compatibility */
+  color: transparent;
+}
+
+.Subtitle {
+  margin: -0.25rem 0 0.75rem;
+  font-size: 0.95rem;
+  color: #b2b8d6;
+}
+
+.Label span {
+  display: inline-block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: #c7cee8;
+}
+
+.Input {
+  width: 100%;
+  padding: 0.8rem 0.95rem;
+  font-size: 0.95rem;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.25);
+  background: rgba(255,255,255,0.12);
+  color: #fff;
+  outline: none;
+  transition: border-color 0.25s, background 0.25s;
+}
+
+.Input:focus {
+  border-color: #7f5af0;
+  background: rgba(255,255,255,0.18);
+}
+
+.PasswordWrapper { position: relative; display: flex; }
+
+.Toggle {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: #c7cee8;
+  font-size: 0.75rem;
+  cursor: pointer;
+  font-weight: 600;
+  padding: 4px 6px;
+  border-radius: 6px;
+  transition: background 0.2s, color 0.2s;
+}
+
+.Toggle:hover { background: rgba(255,255,255,0.15); color: #fff; }
+
+.Row { display: flex; justify-content: space-between; align-items: center; margin-top: 2px; }
+
+.CheckLabel { display: flex; align-items: center; gap: 6px; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.3px; color: #c7cee8; }
+.CheckLabel input { accent-color: #7f5af0; cursor: pointer; }
+
+.LinkButton {
+  background: none;
+  border: none;
+  color: #7f9ef5;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 8px;
+  transition: background 0.2s, color 0.2s;
+}
+.LinkButton:hover { background: rgba(255,255,255,0.12); color: #fff; }
+
+.Submit {
+  margin-top: 0.35rem;
+  width: 100%;
+  padding: 0.85rem 1rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  border: none;
+  border-radius: 18px;
+  background: linear-gradient(135deg, #7f5af0 0%, #6241c9 50%, #5133ad 100%);
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 8px 24px -6px rgba(127,90,240,0.55), 0 2px 6px -1px rgba(0,0,0,0.6);
+  transition: transform 0.18s ease, box-shadow 0.25s ease, filter 0.25s;
+  position: relative;
+  overflow: hidden;
+}
+
+.Submit:hover { transform: translateY(-2px); box-shadow: 0 12px 32px -8px rgba(127,90,240,0.7), 0 4px 10px -2px rgba(0,0,0,0.65); }
+.Submit:active { transform: translateY(0); }
+.Submit:disabled { opacity: 0.6; cursor: not-allowed; filter: grayscale(0.4); }
+
+.Spinner {
+  width: 18px;
+  height: 18px;
+  border: 3px solid rgba(255,255,255,0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  display: inline-block;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.Error {
+  background: rgba(255, 77, 77, 0.15);
+  border: 1px solid rgba(255, 120, 120, 0.4);
+  color: #ffb3b3;
+  padding: 0.65rem 0.85rem;
+  font-size: 0.75rem;
+  border-radius: 12px;
+  line-height: 1.2;
+}
+
+.Divider {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 0.6rem;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #8892b2;
+  margin-top: 0.75rem;
+}
+.Divider::before, .Divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(255,255,255,0.05), rgba(255,255,255,0.3), rgba(255,255,255,0.05));
+}
+
+.SocialRow { display: flex; gap: 0.75rem; }
+.SocialBtn {
+  flex: 1;
+  padding: 0.65rem 0.75rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+  border: 1px solid rgba(255,255,255,0.22);
+  background: rgba(255,255,255,0.1);
+  color: #d7dbec;
+  border-radius: 14px;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background 0.25s, color 0.25s, box-shadow 0.25s;
+}
+.SocialBtn:hover { background: rgba(127,90,240,0.18); color: #fff; box-shadow: 0 4px 14px -4px rgba(127,90,240,0.5); }
+
+.FinePrint {
+  margin: 0.5rem 0 0 0;
+  font-size: 0.55rem;
+  line-height: 1.2;
+  letter-spacing: 0.5px;
+  color: #7c849f;
+  text-align: center;
+}
+
+@media (max-width: 520px) {
+  .Card { padding: 1.6rem 1.4rem 1.9rem; border-radius: 22px; }
+  .Title { font-size: 2.1rem; }
+  .SocialRow { flex-direction: column; }
+  .SocialBtn { width: 100%; }
+}

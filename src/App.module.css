@@ -1,0 +1,55 @@
+.App {
+  display: flex;
+  flex-direction: column;
+  align-items: center; /* use full available width */
+  gap: 20px;
+  height: 100vh;
+  width: 150vh;
+  padding: 24px; /* increase overall padding so content breathes */
+}
+
+.Header {
+  text-align: center;
+}
+
+.HeaderRow {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.Logo {
+  width: 72px;
+  height: 72px;
+}
+
+.Title {
+  margin: 0;
+}
+
+.LogoutButton {
+  background: linear-gradient(135deg, #ff6b6b 0%, #d94c4c 100%);
+  color: #fff;
+  font-weight: 600;
+  font-size: 0.75rem;
+  letter-spacing: 0.5px;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 20px;
+  cursor: pointer;
+  box-shadow: 0 4px 12px -4px rgba(217,76,76,0.6);
+  transition: transform 0.18s ease, box-shadow 0.25s ease;
+}
+
+.LogoutButton:hover { transform: translateY(-2px); box-shadow: 0 6px 16px -4px rgba(217,76,76,0.7); }
+.LogoutButton:active { transform: translateY(0); }
+
+.ChatContainer {
+  flex-grow: 1;
+  width: 100%;
+  background: light-dark(#ffffff, #212121);
+  border-radius: 16px;
+  overflow-y: auto;
+}

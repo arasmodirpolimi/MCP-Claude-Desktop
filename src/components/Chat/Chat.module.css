@@ -1,0 +1,52 @@
+.Chat {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  padding: 8px;
+  overflow-y: auto;
+}
+
+.Group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.Group:nth-last-of-type(2) {
+  /* 8px - gap between groups */
+  min-height: calc(100% - 8px);
+}
+
+.Message {
+  width: 98%;
+  padding: 0 18px;
+  border-radius: 16px;
+  font-size: 14px;
+
+  &[data-role="user"] {
+    align-self: flex-end;
+    background: light-dark(#f3f3f3, #303030);
+  }
+}
+.Message[data-role="tool"] {
+  background: #0f3d5e;
+  border: 1px solid #2563eb;
+  font-size: 0.85rem;
+  line-height: 1.3;
+  position: relative;
+}
+
+.Message[data-role="tool"]::before {
+  content: "Tool";
+  position: absolute;
+  top: -0.6rem;
+  left: 0.75rem;
+  background: #2563eb;
+  color: #fff;
+  padding: 0 0.4rem;
+  font-size: 0.6rem;
+  border-radius: 3px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
