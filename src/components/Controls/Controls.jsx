@@ -35,43 +35,45 @@ export function Controls( {isDisabled = false, isStreaming = false, onSend, onCa
 
   return (
     <div className={styles.Controls}>
-      <div style={{ display:'flex', gap:'0.5rem', alignItems:'center', flexWrap:'wrap', marginBottom:'0.4rem' }}>
-        <label style={{ display:'flex', flexDirection:'column', fontSize:'0.65rem', color:'#ccc' }}>
-          <span style={{ marginBottom:2 }}>Model</span>
-          <select
-            value={selectedModel}
-            onChange={e=>setSelectedModel(e.target.value)}
+      <div className={styles.Row}>
+        <div className={styles.LeftCluster}>
+          <label className={styles.ModelSelectLabel}>
+            <span className={styles.LabelCaption}>Model</span>
+            <select
+              value={selectedModel}
+              onChange={e=>setSelectedModel(e.target.value)}
+              disabled={isDisabled}
+              className={styles.ModelSelect}
+            >
+              <option value="claude-3-5-sonnet-latest">Sonnet</option>
+              <option value="claude-3-5-haiku-latest">Haiku</option>
+              <option value="claude-3-opus-latest">Opus</option>
+            </select>
+          </label>
+          <label className={styles.ToolsToggleLabel}>
+            <input type="checkbox" checked={enableTools} disabled={isDisabled} onChange={e=>setEnableTools(e.target.checked)} />
+            <span>Use tools</span>
+          </label>
+        </div>
+        <div className={styles.TextAreaContainer}>
+          <TextareaAutosize
+            className={styles.TextArea}
+            placeholder="Message AI Chatbot"
+            value={content}
+            ref={textareaRef}
             disabled={isDisabled}
-            style={{ padding:'0.35rem 0.5rem', background:'#222', color:'#eee', border:'1px solid #444', borderRadius:4, fontSize:'0.75rem' }}
-          >
-            <option value="claude-3-5-sonnet-latest">Sonnet</option>
-            <option value="claude-3-5-haiku-latest">Haiku</option>
-            <option value="claude-3-opus-latest">Opus</option>
-          </select>
-        </label>
-        <label style={{ display:'flex', alignItems:'center', gap:6, fontSize:'0.7rem', color:'#ccc' }}>
-          <input type="checkbox" checked={enableTools} disabled={isDisabled} onChange={e=>setEnableTools(e.target.checked)} />
-          Use tools
-        </label>
-      </div>
-      <div className={styles.TextAreaContainer}>
-        <TextareaAutosize
-          className={styles.TextArea}
-          placeholder="Message AI Chatbot"
-          value={content}
-          ref={textareaRef}
-          disabled={isDisabled}
-          minRows={1}
-          maxRows={4}
-          onChange={handleContentChange}
-          onKeyDown={handleEnterPress}
-        />
-      </div>
-      <div style={{ display:'flex', gap:'0.5rem' }}>
-        <button className={styles.Button} disabled={isDisabled || isStreaming} onClick={handleContentSend}>
-          <SendIcon />
-        </button>
-        <button className={styles.Button} style={{ background:'#442' }} disabled={!isStreaming} onClick={onCancel}>⏹</button>
+            minRows={1}
+            maxRows={4}
+            onChange={handleContentChange}
+            onKeyDown={handleEnterPress}
+          />
+        </div>
+        <div className={styles.Actions}>
+          <button className={styles.Button} disabled={isDisabled || isStreaming} onClick={handleContentSend} title="Send">
+            <SendIcon />
+          </button>
+          <button className={styles.Button} data-variant="stop" disabled={!isStreaming} onClick={onCancel} title="Cancel streaming">⏹</button>
+        </div>
       </div>
     </div>
   );
