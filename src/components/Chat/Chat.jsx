@@ -1,4 +1,4 @@
-import { useRef, useEffect, useMemo, useState } from "react";
+import { useRef, useEffect, useMemo, useState, useCallback } from "react";
 import Markdown from "react-markdown";
 import styles from "./Chat.module.css";
 import { useMcpServers } from "../../context/McpServersContext";
@@ -75,8 +75,12 @@ const WELCOME_MESSAGE_GROUP = [
   { role: "assistant", content: "Hello! How can I assist you right now?" },
 ];
 
-export function Chat({ messages, activeServerId, activeServerName = '', onToolResult, autoRunTools = true, sessionId: externalSessionId }) {
+export function Chat({ messages, activeServerId, activeServerName = '', onToolResult, autoRunTools = true, sessionId: externalSessionId, isLoading = false, isStreaming = false, activeToolExecs = [], onClearMemory }) {
   const messagesEndRef = useRef(null);
+  const scrollRef = useRef(null);
+  const [userNearBottom, setUserNearBottom] = useState(true);
+  const [expandedTools, setExpandedTools] = useState({}); // tool -> bool
+  const [, forceTick] = useState(0); // for elapsed time re-render
   // Use externally provided sessionId (source of truth) or fall back once
   const [sessionId] = useState(() => {
     if (typeof externalSessionId === 'string' && externalSessionId.length > 10) return externalSessionId;
@@ -127,12 +131,48 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
     }
   } catch {}
 
+  // Smart autoscroll: only scroll if user is already near bottom
+  const updateUserNearBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const threshold = 140; // px from bottom
+    const distance = el.scrollHeight - (el.scrollTop + el.clientHeight);
+    setUserNearBottom(distance < threshold);
+  }, []);
+
   useEffect(() => {
-    const lastMessage = (messages || [])[messages.length - 1];
-    if (lastMessage) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
-  }, [messages]);
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => updateUserNearBottom();
+    el.addEventListener('scroll', onScroll, { passive: true });
+    updateUserNearBottom();
+    // Elapsed timer interval
+    const iv = setInterval(() => {
+      const running = activeToolExecs.some(e => e.status === 'running');
+      if (running) forceTick(t => t + 1); // trigger re-render
+    }, 500);
+    return () => el.removeEventListener('scroll', onScroll);
+    // cleanup interval
+    return () => { clearInterval(iv); el.removeEventListener('scroll', onScroll); };
+  }, [updateUserNearBottom, activeToolExecs]);
+  function formatElapsed(exec) {
+    const end = exec.finishedAt || Date.now();
+    const ms = end - exec.startedAt;
+    if (ms < 1000) return (ms/1000).toFixed(2)+'s';
+    if (ms < 60000) return (ms/1000).toFixed(1)+'s';
+    const s = Math.floor(ms/1000);
+    const m = Math.floor(s/60); const rem = s%60;
+    return m + 'm ' + rem + 's';
+  }
+
+  function toggleExpand(tool) { setExpandedTools(prev => ({ ...prev, [tool]: !prev[tool] })); }
+
+  // Memory clear now handled externally; ensure no duplicate greeting since we inject welcome group separately.
+
+  useEffect(() => {
+    if (!userNearBottom) return; // respect user's manual scroll position
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, userNearBottom]);
 
   // Fetch memory stats periodically (lightweight)
   useEffect(() => {
@@ -219,6 +259,8 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
       setMemoryStats({ messages: 0, summaries: 0, chars: 0 });
       setMemoryEntries([]);
       setMemorySummaries([]);
+      // Also clear chat history via parent (keeps welcome)
+      onClearMemory?.();
     } catch {}
   }
 
@@ -287,7 +329,8 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
   }
 
   return (
-    <div className={styles.Chat}>
+    <div className={styles.Chat} ref={scrollRef}>
+      <div className={styles.TopFade} />
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
         <div style={{ fontSize:'0.7rem', opacity:0.8 }}>
           Session: {sessionId}
@@ -334,6 +377,9 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
             return (
               <div key={key} className={styles.Message} data-role={role}>
                 <Markdown>{String(content ?? "")}</Markdown>
+                {isStreaming && groupIndex === messagesGroups.length - 1 && index === group.length - 1 && role === 'assistant' && (
+                  <span className={styles.StreamingCursor} />
+                )}
                 {suggestions.length > 0 && (
                   <div style={{ marginTop: 8 }}>
                     {suggestions.map((s, idx) => (
@@ -351,7 +397,71 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
           })}
         </div>
       ))}
+      {isLoading && (
+        <div style={{ marginTop:4, marginBottom:8 }}>
+          <div className={styles.Message} data-role='assistant' style={{ background:'transparent', boxShadow:'none', padding:'4px 8px' }}>
+            <div className={styles.LoadingBubble}></div>
+            <div className={styles.LoadingBubble} style={{ width:'240px' }}></div>
+            <div className={styles.LoadingBubble} style={{ width:'120px' }}></div>
+          </div>
+        </div>
+      )}
       <div ref={messagesEndRef} />
+      <div className={styles.BottomFade} />
+      {activeToolExecs.length > 0 && (
+        <div className={styles.ToolExecContainer}>
+          {activeToolExecs.map(exec => {
+            const cls = [styles.ToolExecItem];
+            if (exec.status === 'done') cls.push('ToolExecDone');
+            if (exec.status === 'error') cls.push('ToolExecError');
+            const expanded = expandedTools[exec.tool];
+            const preview = (() => {
+              if (exec.output == null) return '';
+              const raw = typeof exec.output === 'string' ? exec.output : JSON.stringify(exec.output, null, 2);
+              return raw.length > 400 ? raw.slice(0,400) + '…' : raw;
+            })();
+            return (
+              <div key={exec.tool} className={cls.join(' ')}>
+                <div style={{ display:'flex', flexDirection:'column', width:'100%', gap:4 }}>
+                  <div className={styles.ToolExecMetaRow}>
+                    <span className={styles.ToolExecName}>{exec.tool}</span>
+                    <span className={styles.ToolExecElapsed}>{formatElapsed(exec)}</span>
+                  </div>
+                  <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                    <span className={styles.ToolExecStatus}>{exec.status === 'running' ? 'executing…' : exec.status}</span>
+                    <div style={{ flex:1 }} className={styles.ToolExecProgress} />
+                    {(exec.output || exec.error || exec.args) && (
+                      <button className={styles.ToolExecToggle} onClick={() => toggleExpand(exec.tool)}>{expanded ? 'Hide' : 'Details'}</button>
+                    )}
+                  </div>
+                  {expanded && (
+                    <div className={styles.ToolExecDetails}>
+                      {exec.args && Object.keys(exec.args).length > 0 && (
+                        <div style={{ marginBottom:4 }}><strong>Args:</strong> <code>{JSON.stringify(exec.args)}</code></div>
+                      )}
+                      {exec.error && (
+                        <div style={{ color:'#f87171', marginBottom:4 }}><strong>Error:</strong> {String(exec.error)}</div>
+                      )}
+                      {exec.output && (
+                        <div><strong>Output:</strong>
+                          <pre style={{ margin:0 }}>{preview}</pre>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {!userNearBottom && (
+        <button
+          onClick={()=> messagesEndRef.current?.scrollIntoView({ behavior:'smooth' })}
+          style={{ position:'sticky', bottom:12, marginLeft:'auto', padding:'6px 10px', fontSize:'0.65rem', background:'#2563eb', color:'#fff', border:'none', borderRadius:16, boxShadow:'0 2px 6px rgba(0,0,0,0.4)', cursor:'pointer' }}
+        >Jump to latest ↓</button>
+      )}
+      {/* Removed Clear Chat View button per updated requirements */}
     </div>
   );
 }
