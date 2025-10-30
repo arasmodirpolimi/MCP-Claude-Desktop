@@ -75,7 +75,7 @@ const WELCOME_MESSAGE_GROUP = [
   { role: "assistant", content: "Hello! How can I assist you right now?" },
 ];
 
-export function Chat({ messages, activeServerId, onToolResult, autoRunTools = true, sessionId: externalSessionId }) {
+export function Chat({ messages, activeServerId, activeServerName = '', onToolResult, autoRunTools = true, sessionId: externalSessionId }) {
   const messagesEndRef = useRef(null);
   // Use externally provided sessionId (source of truth) or fall back once
   const [sessionId] = useState(() => {
@@ -289,7 +289,15 @@ export function Chat({ messages, activeServerId, onToolResult, autoRunTools = tr
   return (
     <div className={styles.Chat}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
-        <div style={{ fontSize:'0.7rem', opacity:0.8 }}>Session: {sessionId} • Mem msgs {memoryStats.messages} • summaries {memoryStats.summaries} • chars {memoryStats.chars}</div>
+        <div style={{ fontSize:'0.7rem', opacity:0.8 }}>
+          Session: {sessionId}
+          {' '}• Mem msgs {memoryStats.messages}
+          {' '}• summaries {memoryStats.summaries}
+          {' '}• chars {memoryStats.chars}
+          {activeServerId && (
+            <span style={{ marginLeft:8, padding:'2px 6px', background:'#222', border:'1px solid #333', borderRadius:4 }} title={`Active MCP server for tool calls: ${activeServerName || activeServerId}`}>Server: {activeServerName || activeServerId.slice(0,8)}</span>
+          )}
+        </div>
         <div style={{ display:'flex', gap:6 }}>
           <button onClick={()=> { if (!showMemoryPanel) loadMemorySnapshot(); setShowMemoryPanel(s=> !s); }} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>{showMemoryPanel ? 'Hide Memory' : 'View Memory'}</button>
           <button onClick={handleClearMemory} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>Clear Memory</button>

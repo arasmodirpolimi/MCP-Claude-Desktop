@@ -17,6 +17,8 @@ import {
   removeTool,
   buildAnthropicTools,
   getToolUsageLog,
+  mapAnthropicToolNameBack,
+  removeToolsByOrigin,
 } from "./registerTools.js";
 import { StdioMcpClient, waitForReady } from "./stdioClient.js";
 import { z } from "zod";
@@ -34,6 +36,518 @@ function createServer() {
 }
 
 const app = express();
+// Helper to spawn servers from config file; re-loadable
+async function spawnServersFromConfig({ replace = false } = {}) {
+  const cfgPath = path.join(process.cwd(), "mcpServers.json");
+  const raw = await fs.readFile(cfgPath, "utf8").catch(() => null);
+  if (!raw) {
+    console.log("[MCP] No mcpServers.json found; skipping auto-spawn");
+    return { ok: true, loaded: 0 };
+  }
+  let cfg;
+  try {
+    cfg = JSON.parse(raw);
+  } catch (e) {
+    console.warn("[MCP] Invalid JSON in mcpServers.json", e);
+    return { ok: false, error: "Invalid JSON", details: String(e?.message || e) };
+  }
+  const entries = cfg?.mcpServers ? Object.entries(cfg.mcpServers) : [];
+  if (!entries.length) {
+    console.log("[MCP] mcpServers.json has empty mcpServers map");
+    return { ok: true, loaded: 0 };
+  }
+  // If replace is true, remove existing external servers not present in config
+  if (replace) {
+    const keepNames = new Set(entries.map(([k]) => k));
+    for (const [id, entry] of [...sessionServers.entries()]) {
+      if ((entry.type === "external" || entry.type === 'filesystem' || entry.type === 'filesystem-inproc' || entry.type === 'filesystem-degraded') && !keepNames.has(entry.name)) {
+        try { entry.transport.close?.(); } catch {}
+        sessionServers.delete(id);
+        // Prune bridged tools originating from this server
+        const removed = removeToolsByOrigin(entry.name);
+        console.log("[MCP] removed external server not in config", entry.name, id, "pruned tools:", removed);
+      }
+    }
+  }
+  let loaded = 0;
+  // Helper to attach degraded filesystem tools when falling back
+  function registerDegradedFsTools(targetServer) {
+    const names = [];
+    try {
+      const readSchema = z.object({ path: z.string().describe('File path to read (relative or absolute)') });
+      const readHandler = async ({ path: filePath }) => {
+        try {
+          const full = path.resolve(process.cwd(), filePath);
+          const data = await fs.readFile(full, 'utf8');
+          return { content: [{ type: 'text', text: data.slice(0, 8000) }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: 'Error reading file: ' + String(e?.message || e) }] };
+        }
+      };
+      targetServer.tool('fs_read_file', 'Read a text file (degraded local)', readSchema, readHandler);
+      if (!TOOL_DEFS['fs_read_file']) {
+        try { addTool({ name: 'fs_read_file', description: 'Read a UTF-8 text file from the local workspace (degraded mode)', inputSchema: readSchema, handler: readHandler }); } catch {}
+      }
+      names.push('fs_read_file');
+
+      const listSchema = z.object({ dir: z.string().describe('Directory path to list (non-recursive)') });
+      const listHandler = async ({ dir }) => {
+        try {
+          const full = path.resolve(process.cwd(), dir);
+          const entries = await fs.readdir(full).catch(() => []);
+          return { content: [{ type: 'text', text: entries.slice(0, 200).join('\n') }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: 'Error listing directory: ' + String(e?.message || e) }] };
+        }
+      };
+      targetServer.tool('fs_list_directory', 'List files in directory (degraded local)', listSchema, listHandler);
+      if (!TOOL_DEFS['fs_list_directory']) {
+        try { addTool({ name: 'fs_list_directory', description: 'List files in a directory (non-recursive, degraded mode)', inputSchema: listSchema, handler: listHandler }); } catch {}
+      }
+      names.push('fs_list_directory');
+    } catch (err) {
+      console.warn('[MCP] failed registering degraded fs tools', err);
+    }
+    return names;
+  }
+  for (const [key, def] of entries) {
+    let { command, args = [], type = "external", name = key } = def || {};
+    if (!command) { console.warn("[MCP] skip", key, "missing command"); continue; }
+    // Consolidated duplicate detection: Treat any existing server whose name matches (or filesystem variants) as duplicate
+    const existingVariant = [...sessionServers.values()].find(s => s.name === name || (
+      name === 'filesystem' && ['filesystem','filesystem-inproc','filesystem-degraded'].includes(s.type)
+    ));
+    if (existingVariant) {
+      // If we previously had a degraded/inproc filesystem and config still asks for filesystem, attempt upgrade by spawning external ONLY once
+      const wantsFilesystem = args.includes("@modelcontextprotocol/server-filesystem");
+      if (wantsFilesystem && ['filesystem-inproc','filesystem-degraded'].includes(existingVariant.type)) {
+        // Attempt upgrade: remove old entry then allow loop to spawn fresh external
+        const toRemoveId = [...sessionServers.entries()].find(([id, v]) => v === existingVariant)?.[0];
+        if (toRemoveId) {
+          try { existingVariant.transport.close?.(); } catch {}
+          sessionServers.delete(toRemoveId);
+          console.log('[MCP] upgrading', existingVariant.type, 'to external filesystem via fresh spawn');
+        }
+      } else {
+        continue; // duplicate; skip spawning another
+      }
+    }
+    try {
+      const id = randomUUID();
+      if (type === "external") {
+        // Build potential spawn variants for Windows npx ENOENT and filesystem server fallbacks
+        const spawnAttempts = [];
+        const variants = [];
+        const isFilesystem = args.includes("@modelcontextprotocol/server-filesystem");
+        // If config implies filesystem server, upgrade type so downstream UI can distinguish
+  if (isFilesystem) type = 'filesystem';
+        // Optional override: force in-process import (HTTP transport) instead of stdio process when MCP_FORCE_INPROC=1
+        if (isFilesystem && process.env.MCP_FORCE_INPROC === '1') {
+          try {
+            const require = createRequire(import.meta.url);
+            const mod = require("@modelcontextprotocol/server-filesystem");
+            if (mod && typeof mod.createServer === 'function') {
+              const fsServerInproc = new McpServer({ name: `${name}-filesystem-inproc`, version: '1.0.0', capabilities: { tools: {}, resources: {} } });
+              // Register degraded tools so at minimum read/list available; actual module tools may self-register internally
+              registerDegradedFsTools(fsServerInproc);
+              const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+              await fsServerInproc.connect(transport);
+              const degradedNames = Object.keys(TOOL_DEFS).filter(n => ['fs_read_file','fs_list_directory'].includes(n));
+              sessionServers.set(id, { server: fsServerInproc, transport, name, type: 'filesystem-inproc', baseUrl: null, spawnAttempts: [{ label: 'inproc-forced', ok: true }], note: 'MCP_FORCE_INPROC active; stdio disabled.', toolCount: degradedNames.length, degradedTools: degradedNames });
+              console.log('[MCP] forced in-process filesystem server created (MCP_FORCE_INPROC=1)', key, 'id', id);
+              loaded++;
+              continue; // skip external spawning entirely
+            } else {
+              console.warn('[MCP] filesystem module createServer not found; falling back to external spawn');
+            }
+          } catch (e) {
+            console.warn('[MCP] forced inproc import failed; falling back to external spawn', e?.message || e);
+          }
+        }
+        // Normalize config: treat npx exec pattern as npm exec for reliability on Windows
+        if (process.platform === 'win32' && command === 'npx' && args[0] === 'exec') {
+          command = 'npm';
+          console.log('[MCP] normalized npx exec to npm exec for filesystem server');
+        }
+        if (process.platform === 'win32' && command.toLowerCase() === 'npx') {
+          // Prefer npx.cmd first on Windows to avoid ENOENT
+          variants.push({ cmd: 'npx.cmd', argv: args, label: 'npx-cmd-primary' });
+          variants.push({ cmd: 'npx', argv: args, label: 'npx-alt' });
+        } else {
+          variants.push({ cmd: command, argv: args, label: 'primary' });
+          if (process.platform === 'win32' && command.toLowerCase() === 'npx.cmd') {
+            variants.push({ cmd: 'npx', argv: args, label: 'npx-alt' });
+          }
+        }
+        if (isFilesystem) {
+          const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+          variants.push({ cmd: npmCmd, argv: ['exec','@modelcontextprotocol/server-filesystem','.'], label: 'npm-exec-filesystem' });
+          // Attempt to locate npm if ENOENT likely (common on some Windows setups without PATH propagation)
+          const candidateNpmPaths = [
+            process.env.APPDATA ? path.join(process.env.APPDATA, 'npm', 'npm.cmd') : null,
+            'C://Program Files//nodejs//npm.cmd',
+            'C://Program Files (x86)//nodejs//npm.cmd'
+          ].filter(Boolean);
+          for (const cand of candidateNpmPaths) {
+            try { await fs.access(cand); variants.push({ cmd: cand, argv: ['exec','@modelcontextprotocol/server-filesystem','.'], label: 'npm-candidate' }); break; } catch {}
+          }
+            // NEW: Explicit direct node execution of the package's dist/index.js when npm/npx unavailable.
+            try {
+              const distPath = path.join(process.cwd(), 'node_modules', '@modelcontextprotocol', 'server-filesystem', 'dist', 'index.js');
+              await fs.access(distPath);
+              // Provide '.' as workspace root arg (same as npm exec behavior)
+              variants.push({ cmd: process.execPath, argv: [distPath, '.'], label: 'node-direct-dist' });
+            } catch {}
+          // Direct bin script resolution (pre-fallback) using process.execPath
+          try {
+            const require = createRequire(import.meta.url);
+            const pkgPath = require.resolve('@modelcontextprotocol/server-filesystem/package.json');
+            const pkgDir = path.dirname(pkgPath);
+            const pkgJson = JSON.parse(await fs.readFile(pkgPath,'utf8'));
+            const binEntries = [];
+            if (typeof pkgJson.bin === 'string') binEntries.push(path.join(pkgDir, pkgJson.bin));
+            else if (pkgJson.bin && typeof pkgJson.bin === 'object') {
+              for (const v of Object.values(pkgJson.bin)) binEntries.push(path.join(pkgDir, v));
+            }
+            binEntries.push(path.join(pkgDir,'dist','index.js'));
+            for (const be of binEntries) {
+              try { await fs.access(be); variants.push({ cmd: process.execPath, argv: [be,'.'], label: 'node-bin-script' }); break; } catch {}
+            }
+          } catch (e) {
+            spawnAttempts.push({ label: 'node-bin-script-prepare', ok: false, error: String(e?.message || e) });
+          }
+        }
+        let proc = null;
+        for (const v of variants) {
+          if (proc) break;
+          try {
+            proc = spawn(v.cmd, v.argv, { cwd: process.cwd(), stdio: ["pipe","pipe","pipe"] });
+            proc._spawnLabel = v.label;
+            spawnAttempts.push({ label: v.label, command: v.cmd, args: v.argv, ok: true });
+          } catch (e) {
+            spawnAttempts.push({ label: v.label, command: v.cmd, args: v.argv, ok: false, error: String(e?.message || e) });
+          }
+        }
+        if (!proc) {
+          console.warn('[auto-external-mcp] all spawn variants failed for', key);
+          // Filesystem specific fallback: attempt in-process import or degraded
+          if (isFilesystem) {
+            let inprocOk = false;
+            try {
+              const require = createRequire(import.meta.url);
+              const mod = require("@modelcontextprotocol/server-filesystem");
+              if (mod && typeof mod.createServer === 'function') {
+                const fsServerInproc = new McpServer({ name: `${name}-filesystem-inproc`, version: '1.0.0', capabilities: { tools: {}, resources: {} } });
+                // Register degraded tools BEFORE connecting (SDK disallows tool registration after connect)
+                const degradedNames = registerDegradedFsTools(fsServerInproc);
+                const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+                await fsServerInproc.connect(transport);
+                sessionServers.set(id, { server: fsServerInproc, transport, name, type: 'filesystem-inproc', baseUrl: null, spawnAttempts, note: 'In-process import fallback active.', toolCount: degradedNames.length, degradedTools: degradedNames });
+                console.log('[MCP] filesystem in-process fallback created', key, 'id', id);
+                inprocOk = true;
+              }
+            } catch (e) {
+              spawnAttempts.push({ label: 'inproc-import', ok: false, error: String(e?.message || e) });
+            }
+            if (!inprocOk) {
+              const fsServerDegraded = new McpServer({ name: `${name}-filesystem-degraded`, version: '1.0.0', capabilities: { tools: {}, resources: {} } });
+              // Register degraded tools before connect
+              const degradedNames = registerDegradedFsTools(fsServerDegraded);
+              const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+              await fsServerDegraded.connect(transport);
+              sessionServers.set(id, { server: fsServerDegraded, transport, name, type: 'filesystem-degraded', baseUrl: null, warning: 'All spawn attempts failed; degraded static tools active.', spawnAttempts, toolCount: degradedNames.length, degradedTools: degradedNames });
+              console.log('[MCP] filesystem degraded fallback created', key, 'id', id);
+            }
+          }
+          continue; // move on to next configured server
+        }
+        let stdoutBuf = ""; let stderrBuf = ""; let started = false; const birth = Date.now();
+        proc.stdout.setEncoding("utf8"); proc.stderr.setEncoding("utf8");
+        proc.stdout.on("data", c => { const t = c.toString(); stdoutBuf += t; if (!started && stdoutBuf.length) started = true; });
+        proc.stderr.on("data", c => { const t = c.toString(); stderrBuf += t; if (/Error|ENOENT|EACCES|ECONNREFUSED/i.test(t)) console.warn("[auto-external-mcp][stderr]", t.trim()); });
+        proc.on("exit", code => { console.log("[auto-external-mcp] process exited", code, key); const life = Date.now()-birth; if (life < 2000 && !started) { const entry = sessionServers.get(id); if (entry) entry.warning = "Exited immediately; no tools."; }});
+        proc.on('error', err => {
+          console.error('[auto-external-mcp] spawn error', err);
+          // Windows-specific ENOENT guidance for npm/npx issues
+          if (err?.code === 'ENOENT' && process.platform === 'win32') {
+            console.warn('[auto-external-mcp] npm ENOENT on Windows. Troubleshooting steps:');
+            console.warn('  1) Ensure Node.js installation added npm.cmd to PATH (re-open terminal).');
+            console.warn('  2) Try setting command to "npm.cmd" in mcpServers.json for filesystem server.');
+            console.warn('  3) Run: npm install @modelcontextprotocol/server-filesystem (module appears missing).');
+            console.warn('  4) As fallback set MCP_FORCE_INPROC=1 (if package installed) to avoid spawning.');
+          }
+          if (/Cannot find module '@modelcontextprotocol\/server-filesystem'/.test(String(err))) {
+            console.warn('[auto-external-mcp] Module not found. Install with: npm install @modelcontextprotocol/server-filesystem');
+          }
+          const entry = sessionServers.get(id);
+          if (entry) entry.warning = 'Spawn error: ' + (err?.code || String(err?.message || err));
+        });
+        const server = new McpServer({ name: `${name}-external-mcp`, version: "1.0.0", capabilities: { tools: {}, resources: {} } });
+        const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+        await server.connect(transport);
+        let stdioClient = null; try { stdioClient = new StdioMcpClient(proc, { timeoutMs: 8000 }); } catch (e) { console.warn("[auto-external-mcp] failed StdioMcpClient", e); }
+        const serverEntry = { server, transport, name, type: isFilesystem ? 'filesystem' : 'external', proc, stdioClient, external: { command, args, attempts: spawnAttempts }, baseUrl: null, stdout: () => stdoutBuf.slice(-4000), stderr: () => stderrBuf.slice(-4000), toolCount: 0, spawnAttempts };
+        sessionServers.set(id, serverEntry);
+        (async () => {
+          if (!stdioClient) return;
+          const ready = await waitForReady(stdioClient).catch(()=>false);
+          if (!ready) {
+            console.warn("[auto-external-mcp] readiness probe timed out for", key);
+            if (isFilesystem) {
+              // Mutate existing entry instead of delete to avoid stale id 404
+              try { proc?.kill?.(); } catch {}
+              let swapped = false;
+              // Try in-process import replacement
+              try {
+                const require = createRequire(import.meta.url);
+                const mod = require("@modelcontextprotocol/server-filesystem");
+                if (mod && typeof mod.createServer === 'function') {
+                  const fsServerInproc = new McpServer({ name: `${name}-filesystem-inproc`, version: '1.0.0', capabilities: { tools: {}, resources: {} } });
+                  const degradedNames = registerDegradedFsTools(fsServerInproc);
+                  // Reuse transport path
+                  const transport2 = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+                  await fsServerInproc.connect(transport2);
+                  Object.assign(serverEntry, { server: fsServerInproc, transport: transport2, type: 'filesystem-inproc', warning: null, note: 'Timeout: swapped to inproc', toolCount: degradedNames.length, degradedTools: degradedNames });
+                  sessionServers.set(id, serverEntry);
+                  console.log('[MCP] Swapped external filesystem to inproc after timeout');
+                  swapped = true;
+                }
+              } catch (e) {
+                console.warn('[MCP] inproc import after timeout failed', e?.message || e);
+              }
+              if (!swapped) {
+                const fsServerDegraded = new McpServer({ name: `${name}-filesystem-degraded`, version: '1.0.0', capabilities: { tools: {}, resources: {} } });
+                const degradedNames = registerDegradedFsTools(fsServerDegraded);
+                const transport3 = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+                await fsServerDegraded.connect(transport3);
+                Object.assign(serverEntry, { server: fsServerDegraded, transport: transport3, type: 'filesystem-degraded', warning: 'External readiness timeout; degraded tools active.', toolCount: degradedNames.length, degradedTools: degradedNames });
+                sessionServers.set(id, serverEntry);
+                console.log('[MCP] Swapped external filesystem to degraded after timeout');
+              }
+            }
+            return;
+          }
+          console.log("[auto-external-mcp] ready tools for", key);
+          try {
+            const tools = await stdioClient.listTools({ forceRefresh: true });
+            serverEntry.toolCount = Array.isArray(tools) ? tools.length : 0;
+          } catch {}
+        })();
+        // Bridge external server tools into internal registry (non-blocking)
+        (async () => {
+          if (!stdioClient) return;
+            try {
+              const tools = await stdioClient.listTools({ forceRefresh: true });
+              if (Array.isArray(tools)) {
+                for (const t of tools) {
+                  if (!t?.name) continue;
+                  const baseName = t.name;
+                  let finalName = baseName;
+                  // Avoid name collision: if already exists, namespace with server name
+                  if (TOOL_DEFS[finalName]) finalName = `${name}:${baseName}`;
+                  if (TOOL_DEFS[finalName]) continue; // still collision, skip
+                  const rawSchema = t.input_schema || t.inputSchema || { type: 'object', properties: {} };
+                  const props = rawSchema.properties || {};
+                  const required = Array.isArray(rawSchema.required) ? rawSchema.required : [];
+                  const shape = {};
+                  for (const [pk, pv] of Object.entries(props)) {
+                    const pType = pv?.type || 'string';
+                    let zType;
+                    switch (pType) {
+                      case 'number': zType = z.number(); break;
+                      case 'boolean': zType = z.boolean(); break;
+                      default: zType = z.string(); break;
+                    }
+                    if (!required.includes(pk)) zType = zType.optional();
+                    shape[pk] = zType;
+                  }
+                  const inputSchema = z.object(shape);
+                  const handler = async (args = {}) => {
+                    try {
+                      const result = await stdioClient.callTool(baseName, args);
+                      if (result && result.content) return result;
+                      return { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+                    } catch (err) {
+                      return { content: [{ type: 'text', text: 'External tool error: ' + String(err?.message || err) }] };
+                    }
+                  };
+                  try {
+                    addTool({ name: finalName, description: t.description || '', inputSchema, handler, origin: name });
+                    // Attach bridged tool to server instance so listTools via HTTP includes it
+                    try { server.tool(finalName, t.description || '', inputSchema, handler); } catch {}
+                    console.log('[MCP] bridged external tool', finalName, 'from auto-spawn server', name);
+                  } catch (e) {
+                    console.warn('[MCP] failed bridging tool', finalName, e);
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn('[MCP] bridge external tools failed for', name, e?.message || e);
+            }
+        })();
+        console.log("[MCP] auto-spawned external server", key, "id", id, "command", command, "args", args);
+        loaded++;
+      } else {
+        console.warn("[MCP] auto-spawn unsupported type", type, "for", key);
+      }
+    } catch (e) {
+      console.warn("[MCP] failed auto-spawning", key, e);
+    }
+  }
+  // Post-spawn duplicate cleanup: ensure only one filesystem server instance remains
+  try {
+    const fsEntries = [...sessionServers.entries()].filter(([, v]) => v.name === 'filesystem');
+    if (fsEntries.length > 1) {
+      // Precedence order
+      const precedence = {
+        'filesystem': 4,
+        'filesystem-inproc': 3,
+        'filesystem-degraded': 2,
+        'external': 1
+      };
+      // Pick winner with highest precedence type
+      let winner = fsEntries[0];
+      for (const e of fsEntries) {
+        const [, v] = e;
+        if (precedence[v.type] > precedence[winner[1].type]) winner = e;
+      }
+      for (const e of fsEntries) {
+        if (e[0] === winner[0]) continue;
+        try { e[1].transport.close?.(); } catch {}
+        sessionServers.delete(e[0]);
+        console.log('[MCP] duplicate filesystem server removed', e[0], e[1].type);
+      }
+    }
+  } catch (cleanupErr) {
+    console.warn('[MCP] duplicate cleanup error', cleanupErr);
+  }
+  return { ok: true, loaded };
+}
+
+// Unified external tool bridging helper (extracts logic used during spawn) so we can re-run on demand.
+async function bridgeExternalTools(stdioClient, serverEntry, name) {
+  if (!stdioClient) return { ok: false, error: 'No stdioClient' };
+  try {
+    const tools = await stdioClient.listTools({ forceRefresh: true });
+    if (!Array.isArray(tools)) return { ok: false, error: 'No tools array returned' };
+    let added = 0;
+    for (const t of tools) {
+      if (!t?.name) continue;
+      const baseName = t.name;
+      let finalName = baseName;
+      if (TOOL_DEFS[finalName]) finalName = `${name}:${baseName}`; // namespace to avoid collision
+      if (TOOL_DEFS[finalName]) continue; // still collision
+      const rawSchema = t.input_schema || t.inputSchema || { type: 'object', properties: {} };
+      const props = rawSchema.properties || {};
+      const required = Array.isArray(rawSchema.required) ? rawSchema.required : [];
+      const shape = {};
+      for (const [pk, pv] of Object.entries(props)) {
+        const pType = pv?.type || 'string';
+        let zType;
+        switch (pType) {
+          case 'number': zType = z.number(); break;
+          case 'boolean': zType = z.boolean(); break;
+          default: zType = z.string(); break;
+        }
+        if (!required.includes(pk)) zType = zType.optional();
+        shape[pk] = zType;
+      }
+      const inputSchema = z.object(shape);
+      const handler = async (args = {}) => {
+        try {
+          const result = await stdioClient.callTool(baseName, args);
+          if (result && result.content) return result;
+          return { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+        } catch (err) {
+          return { content: [{ type: 'text', text: 'External tool error: ' + String(err?.message || err) }] };
+        }
+      };
+      try {
+        addTool({ name: finalName, description: t.description || '', inputSchema, handler, origin: name });
+        try { serverEntry.server?.tool(finalName, t.description || '', inputSchema, handler); } catch {}
+        added++;
+      } catch (e) {
+        console.warn('[MCP] bridge tool failed (sync)', finalName, e?.message || e);
+      }
+    }
+    serverEntry.toolCount = typeof serverEntry.toolCount === 'number' ? serverEntry.toolCount + added : added;
+    return { ok: true, added, total: serverEntry.toolCount };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
+// Sync operation: reload config (optional) then attempt readiness + tool bridging for all servers.
+async function syncMcpConfig({ reload = true, replace = false, readinessTimeoutMs = 8000 } = {}) {
+  const status = { reloaded: false, servers: [] };
+  if (reload) {
+    try {
+      const res = await spawnServersFromConfig({ replace });
+      status.reloaded = true;
+      status.reloadResult = res;
+    } catch (e) {
+      status.reloaded = false;
+      status.reloadError = String(e?.message || e);
+    }
+  }
+  // For each external / filesystem server, attempt tools/list & bridging if not already.
+  const entries = [...sessionServers.entries()];
+  for (const [id, entry] of entries) {
+    const serverInfo = { id, name: entry.name, type: entry.type, toolCount: entry.toolCount || 0 };
+    if (entry.stdioClient) {
+      // Wait for readiness by polling tools/list until timeout
+      const start = Date.now();
+      let ready = false;
+      while (Date.now() - start < readinessTimeoutMs) {
+        try {
+          const tools = await entry.stdioClient.listTools({ forceRefresh: true });
+          if (Array.isArray(tools) && tools.length) { ready = true; break; }
+        } catch {}
+        await new Promise(r => setTimeout(r, 350));
+      }
+      serverInfo.ready = ready;
+      // Bridge (idempotent): will skip already added names
+      const bridgeResult = await bridgeExternalTools(entry.stdioClient, entry, entry.name);
+      serverInfo.bridge = bridgeResult;
+    } else {
+      serverInfo.ready = entry.type === 'embedded' || entry.type?.includes('inproc');
+      serverInfo.bridge = { ok: false, error: 'No stdioClient (non-external or spawn failure)' };
+    }
+    status.servers.push(serverInfo);
+  }
+  return status;
+}
+
+// Initial spawn
+(async () => { await spawnServersFromConfig(); })();
+// Watch mcpServers.json for changes and auto-spawn new servers (non-destructive; does not remove missing ones)
+try {
+  const cfgPath = path.join(process.cwd(), 'mcpServers.json');
+  await fs.access(cfgPath).then(() => {
+    fs.watch(cfgPath, { persistent: false }, async (eventType) => {
+      if (eventType !== 'change') return;
+      console.log('[MCP] Detected mcpServers.json change; checking for new servers...');
+      try {
+        const raw = await fs.readFile(cfgPath, 'utf8');
+        const parsed = JSON.parse(raw);
+        const entries = parsed?.mcpServers ? Object.entries(parsed.mcpServers) : [];
+        for (const [key, def] of entries) {
+          const name = (def && def.name) || key;
+          const exists = [...sessionServers.values()].some(s => s.name === name);
+          if (exists) continue; // already present
+          console.log('[MCP] Auto-spawn new server from updated config:', key);
+          // Spawn only new ones; reuse spawnServersFromConfig logic by passing replace=false
+          await spawnServersFromConfig({ replace: false });
+          break; // spawnServersFromConfig will handle all missing; exit loop
+        }
+      } catch (e) {
+        console.warn('[MCP] Failed processing updated mcpServers.json', e);
+      }
+    });
+  }).catch(() => {});
+} catch (e) {
+  console.warn('[MCP] watch setup failed', e);
+}
 // Custom tolerant JSON parser (replaces express.json()) so we can repair common escaping mistakes
 app.use((req, res, next) => {
   const ct = req.headers["content-type"] || "";
@@ -265,6 +779,10 @@ app.post("/api/mcp/servers", async (req, res) => {
       server: { id, name, type, path: `/mcp/${id}`, baseUrl: null },
     });
   }
+  // Guard: disallow manual creation of filesystem/external servers; they must come from mcpServers.json config
+  if (type === 'filesystem' || type === 'external') {
+    return res.status(400).json({ error: 'Manual creation of external/filesystem servers is disabled; edit mcpServers.json and POST /admin/mcp/reload instead.' });
+  }
   if (type === "filesystem") {
     // Launch external filesystem MCP server via npx @modelcontextprotocol/server-filesystem .
     // Windows requires npx.cmd; attempt cross-platform resolution
@@ -479,6 +997,12 @@ app.post("/api/mcp/servers", async (req, res) => {
     });
     proc.on("error", (err) => {
       console.error("[filesystem-mcp] spawn error", err);
+      if (err?.code === 'ENOENT' && process.platform === 'win32') {
+        console.warn('[filesystem-mcp] npm ENOENT on Windows. Suggestions:');
+        console.warn('  - Update mcpServers.json: use "npm.cmd" instead of "npm" for command.');
+        console.warn('  - Verify npm is on PATH. Run "where npm" in PowerShell.');
+        console.warn('  - Ensure dependency installed: npm install @modelcontextprotocol/server-filesystem');
+      }
     });
     // Create a local MCP client server wrapper to expose tools list via our HTTP transport
     const server = new McpServer({
@@ -532,6 +1056,135 @@ app.post("/api/mcp/servers", async (req, res) => {
       },
     });
   }
+  if (type === "external") {
+    // Generic external MCP server (e.g. fetch server) using provided command & args.
+    if (!command) {
+      return res.status(400).json({ error: "Missing command for external server" });
+    }
+    let proc;
+    const spawnAttempts = [];
+    const trySpawn = (label, c, a) => {
+      try {
+        const p = spawn(c, a, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+        p._spawnLabel = label;
+        spawnAttempts.push({ label, command: c, args: a, ok: true });
+        return p;
+      } catch (err) {
+        spawnAttempts.push({ label, command: c, args: a, ok: false, error: String(err?.message || err) });
+        return null;
+      }
+    };
+    proc = trySpawn("primary", command, args);
+    if (!proc) {
+      return res.status(500).json({ error: "Failed to spawn external MCP server", attempts: spawnAttempts });
+    }
+    let started = false;
+    let stderrBuf = "";
+    let stdoutBuf = "";
+    const birth = Date.now();
+    proc.stdout.on("data", (chunk) => {
+      const text = chunk.toString();
+      stdoutBuf += text;
+      if (!started && stdoutBuf.length > 0) started = true; // any output implies start
+    });
+    proc.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderrBuf += text;
+      if (/Error|ENOENT|EACCES|ECONNREFUSED/i.test(text)) console.warn("[external-mcp][stderr]", text.trim());
+    });
+    proc.on("exit", (code) => {
+      const lifespan = Date.now() - birth;
+      console.log("[external-mcp] process exited", code, "label", proc._spawnLabel);
+      if (lifespan < 2000 && !started) {
+        for (const [sid, entry] of sessionServers.entries()) {
+          if (entry.proc === proc && entry.type === "external") {
+            entry.warning = "External MCP process exited immediately; no tools available.";
+            entry.spawnAttempts = spawnAttempts;
+            entry.stderr = stderrBuf.slice(-4000);
+            entry.stdout = stdoutBuf.slice(-4000);
+          }
+        }
+      }
+    });
+    proc.on("error", (err) => console.error("[external-mcp] spawn error", err));
+
+    const server = new McpServer({ name: `${name}-external-mcp`, version: "1.0.0", capabilities: { tools: {}, resources: {} } });
+    const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+    await server.connect(transport);
+    let stdioClient = null;
+    try { stdioClient = new StdioMcpClient(proc, { timeoutMs: 8000 }); } catch (e) { console.warn("[external-mcp] failed creating StdioMcpClient:", e); }
+    sessionServers.set(id, {
+      server,
+      transport,
+      name,
+      type: "external",
+      proc,
+      stdioClient,
+      external: { command, args, cwd },
+      baseUrl: null,
+      stdout: () => stdoutBuf.slice(-4000),
+      stderr: () => stderrBuf.slice(-4000),
+      spawnAttempts,
+    });
+    (async () => {
+      if (!stdioClient) return;
+      const ready = await waitForReady(stdioClient).catch(() => false);
+      if (!ready) console.warn("[external-mcp] readiness probe timed out; tools may be unavailable yet");
+      else console.log("[external-mcp] external server reported tools list readiness");
+    })();
+    // Bridge generic external server tools into internal registry (non-blocking)
+    (async () => {
+      if (!stdioClient) return;
+      try {
+        const tools = await stdioClient.listTools({ forceRefresh: true });
+        if (Array.isArray(tools)) {
+          for (const t of tools) {
+            if (!t?.name) continue;
+            const baseName = t.name;
+            let finalName = baseName;
+            if (TOOL_DEFS[finalName]) finalName = `${name}:${baseName}`;
+            if (TOOL_DEFS[finalName]) continue; // still collision
+            const rawSchema = t.input_schema || t.inputSchema || { type: 'object', properties: {} };
+            const props = rawSchema.properties || {};
+            const required = Array.isArray(rawSchema.required) ? rawSchema.required : [];
+            const shape = {};
+            for (const [pk, pv] of Object.entries(props)) {
+              const pType = pv?.type || 'string';
+              let zType;
+              switch (pType) {
+                case 'number': zType = z.number(); break;
+                case 'boolean': zType = z.boolean(); break;
+                default: zType = z.string(); break;
+              }
+              if (!required.includes(pk)) zType = zType.optional();
+              shape[pk] = zType;
+            }
+            const inputSchema = z.object(shape);
+            const handler = async (args = {}) => {
+              try {
+                const result = await stdioClient.callTool(baseName, args);
+                if (result && result.content) return result;
+                return { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+              } catch (err) {
+                return { content: [{ type: 'text', text: 'External tool error: ' + String(err?.message || err) }] };
+              }
+            };
+            try {
+              addTool({ name: finalName, description: t.description || '', inputSchema, handler, origin: name });
+              try { server.tool(finalName, t.description || '', inputSchema, handler); } catch {}
+              console.log('[MCP] bridged external tool', finalName, 'from manual external server', name);
+            } catch (e) {
+              console.warn('[MCP] failed bridging external generic tool', finalName, e);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[MCP] bridge external generic tools failed', name, e?.message || e);
+      }
+    })();
+    console.log("[MCP] created generic external server", id, name);
+    return res.json({ server: { id, name, type: "external", path: `/mcp/${id}`, baseUrl: null, attempts: spawnAttempts } });
+  }
   return res.status(400).json({ error: "Unsupported server type" });
 });
 
@@ -544,6 +1197,7 @@ app.get("/api/mcp/servers", (req, res) => {
     baseUrl: v.baseUrl || null,
     warning: v.warning || null,
     attempts: v.spawnAttempts ? v.spawnAttempts.slice(-10) : undefined,
+    toolCount: typeof v.toolCount === 'number' ? v.toolCount : undefined,
   }));
   return res.json({ servers });
 });
@@ -621,6 +1275,20 @@ app.get("/api/mcp/servers/:id/tools", async (req, res) => {
       });
     }
   }
+  if (entry.type === "external") {
+    const client = entry.stdioClient;
+    if (!client) {
+      return res.status(500).json({ error: "MCP stdio client not available (spawn failure?)" });
+    }
+    try {
+      const tools = await client.listTools({ forceRefresh: true });
+      entry.toolCount = Array.isArray(tools) ? tools.length : 0;
+      return res.json({ tools });
+    } catch (e) {
+      console.warn("[MCP] tools/list error via external stdio client:", e);
+      return res.json({ tools: [], warning: "Failed JSON-RPC tools/list from external server." });
+    }
+  }
   if (entry.type === "filesystem-degraded") {
     return res.json({
       tools: [],
@@ -692,6 +1360,59 @@ app.post("/api/mcp/servers/:id/tool-call", async (req, res) => {
       return res.status(500).json({ error: String(e?.message || e) });
     }
   }
+  if (entry.type === "external") {
+    const client = entry.stdioClient;
+    if (!client) return res.status(500).json({ error: "Missing stdio client for external server" });
+    try {
+      const result = await client.callTool(name, args || {});
+      // bump tool usage count introspectively if needed; optional logic
+      return res.json({ result, tool: name, transport: "json-rpc" });
+    } catch (e) {
+      console.warn("[MCP] external tools/call JSON-RPC failed", e);
+      return res.status(500).json({ error: "External JSON-RPC call failed", details: String(e?.message || e) });
+    }
+  }
+});
+
+// ---------------- mcpServers.json admin endpoints -----------------
+// GET current config file content
+app.get('/admin/mcp/config', async (req, res) => {
+  try {
+    const cfgPath = path.join(process.cwd(), 'mcpServers.json');
+    const raw = await fs.readFile(cfgPath, 'utf8').catch(() => null);
+    if (!raw) return res.json({ ok: true, config: null, missing: true });
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (e) { return res.status(400).json({ error: 'Invalid JSON in mcpServers.json', details: String(e?.message || e) }); }
+    return res.json({ ok: true, config: parsed });
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+// POST to write new config and reload (replace existing external servers)
+app.post('/admin/mcp/reload', async (req, res) => {
+  const { config, replace = true } = req.body || {};
+  if (!config || typeof config !== 'object') return res.status(400).json({ error: 'Missing config object' });
+  if (!config.mcpServers || typeof config.mcpServers !== 'object') return res.status(400).json({ error: 'config.mcpServers missing or not object' });
+  try {
+    const cfgPath = path.join(process.cwd(), 'mcpServers.json');
+    await fs.writeFile(cfgPath, JSON.stringify(config, null, 4), 'utf8');
+    const result = await spawnServersFromConfig({ replace });
+    return res.json({ ok: true, reload: result });
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// POST /admin/mcp/sync -> { reload?: boolean, replace?: boolean }
+// Reloads config optionally, then attempts readiness & tool bridging for all servers.
+app.post('/admin/mcp/sync', async (req, res) => {
+  const { reload = false, replace = false, timeoutMs = 8000 } = req.body || {};
+  try {
+    const summary = await syncMcpConfig({ reload, replace, readinessTimeoutMs: timeoutMs });
+    return res.json({ ok: true, summary });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
 
 // ---------------- Anthropic basic streaming proxy ------------------
@@ -712,6 +1433,12 @@ app.post("/anthropic/chat", async (req, res) => {
   }
   // Prepend memory context if provided
   const memoryMessages = sessionId ? buildMemoryContext(sessionId) : [];
+  // Build dynamic tool schema + system prompt enumeration (silent unless asked)
+  const tools = buildAnthropicTools();
+  const toolListForSystem = Object.values(TOOL_DEFS)
+    .map((def) => `- ${def.name}: ${def.description}`)
+    .join("\n");
+  const system = `You are a helpful assistant.\nRuntime tools available (list ONLY when the user explicitly asks about tools/capabilities):\n${toolListForSystem || '- (no tools registered)'}\nGuidelines:\n- Do NOT invent tools.\n- Use a tool only if it materially improves the answer or is required for fresh data.\n- If a tool is used mid conversation, respond with final answer after incorporating results.`;
   if (sessionId) {
     // Store user message before model call
     storeMemoryMessage(sessionId, "user", prompt);
@@ -735,7 +1462,59 @@ app.post("/anthropic/chat", async (req, res) => {
     return res.end();
   }
   try {
+    // Helper: produce ordered list of candidate models for fallback
+    function getModelCandidates(primary) {
+      const envRaw = process.env.ANTHROPIC_MODEL_CANDIDATES;
+      const base = envRaw ? envRaw.split(/[,\s]+/).filter(Boolean) : [
+        "claude-3-5-sonnet",
+        "claude-3-5-sonnet-latest",
+        "claude-3-5-haiku",
+        "claude-3-5-haiku-latest",
+        "claude-3-opus",
+        "claude-3-opus-latest"
+      ];
+      const dedup = [];
+      const seen = new Set();
+      if (primary && !seen.has(primary)) { dedup.push(primary); seen.add(primary); }
+      for (const m of base) { if (!seen.has(m)) { dedup.push(m); seen.add(m); } }
+      return dedup;
+    }
+    // Optional cached model list from Anthropic
+    let cachedModelList = globalThis.__anthropic_model_list_cache__ || null;
+    const nowTs = Date.now();
+    if (!cachedModelList || (nowTs - cachedModelList.ts) > 5 * 60 * 1000) {
+      try {
+        if (apiKey) {
+          const listResp = await fetch("https://api.anthropic.com/v1/models", { headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" } });
+          if (listResp.ok) {
+            const data = await listResp.json().catch(()=>null);
+            const names = Array.isArray(data?.data) ? data.data.map(d => d.id).filter(Boolean) : [];
+            cachedModelList = { ts: nowTs, names };
+            globalThis.__anthropic_model_list_cache__ = cachedModelList;
+          }
+        }
+      } catch {}
+    }
+    const availableNames = cachedModelList?.names || [];
+    function pickFallback(tried) {
+      const candidates = getModelCandidates(model);
+      for (const cand of candidates) {
+        if (tried.includes(cand)) continue;
+        // If we have a list of available names, prefer ones present
+        if (availableNames.length && !availableNames.includes(cand)) continue;
+        return cand;
+      }
+      return null;
+    }
     async function callAnthropic(modelName) {
+      const body = {
+        model: modelName,
+        max_tokens,
+        messages: memoryMessages.concat([{ role: "user", content: prompt }]),
+        system,
+        tools, // allow Claude to enumerate / potentially call tools (multi-turn orchestration not yet implemented here)
+        stream: true,
+      };
       return await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
@@ -743,31 +1522,17 @@ app.post("/anthropic/chat", async (req, res) => {
           "anthropic-version": "2023-06-01",
           "content-type": "application/json",
         },
-        body: JSON.stringify({
-          model: modelName,
-          max_tokens,
-          messages: memoryMessages.concat([{ role: "user", content: prompt }]),
-          stream: true,
-        }),
+        body: JSON.stringify(body),
       });
     }
     let upstream = await callAnthropic(model);
-    if (upstream.status === 404) {
+    if (!upstream.ok && upstream.status === 404) {
       const tried = [model];
-      const fallbacks = [
-        "claude-3-5-sonnet-latest",
-        "claude-3-5-haiku-latest",
-        "claude-3-opus-latest",
-      ];
-      for (const fb of fallbacks) {
-        if (tried.includes(fb)) continue;
-        const attempt = await callAnthropic(fb);
-        if (attempt.ok) {
-          upstream = attempt;
-          model = fb;
-          break;
-        }
+      let fb;
+      while ((fb = pickFallback(tried))) {
         tried.push(fb);
+        const attempt = await callAnthropic(fb);
+        if (attempt.ok) { upstream = attempt; model = fb; break; }
       }
     }
     if (!upstream.ok || !upstream.body) {
@@ -779,7 +1544,9 @@ app.post("/anthropic/chat", async (req, res) => {
         .status(upstream.status)
         .json({
           error: `Anthropic upstream error ${upstream.status}`,
-          details,
+          modelTried: model,
+          fallbackAttempted: upstream.status === 404,
+          details: details.slice(0, 400),
         });
     }
     res.setHeader("Content-Type", "text/event-stream");
@@ -813,6 +1580,10 @@ app.post("/anthropic/chat", async (req, res) => {
         if (!line.startsWith("data:")) continue;
         try {
           const payload = JSON.parse(line.slice(5));
+          // Pass through tool_use events as discrete SSE messages for client awareness
+          if (payload?.type === 'tool_use') {
+            res.write(`data: ${JSON.stringify({ tool_use: payload })}\n\n`);
+          }
           const delta =
             payload?.delta?.text ||
             payload?.content_block?.text ||
@@ -905,14 +1676,22 @@ You currently have access to the following runtime tools (enumerate ONLY when as
       body: JSON.stringify(body),
     });
     if (!r.ok) {
+      let txt = await r.text().catch(() => "");
       if (r.status === 404) {
-        const fallbacks = [
+        // Fallback logic via candidate list
+        const envRaw = process.env.ANTHROPIC_MODEL_CANDIDATES;
+        const base = envRaw ? envRaw.split(/[,\s]+/).filter(Boolean) : [
+          "claude-3-5-sonnet",
           "claude-3-5-sonnet-latest",
+          "claude-3-5-haiku",
           "claude-3-5-haiku-latest",
-          "claude-3-opus-latest",
+          "claude-3-opus",
+          "claude-3-opus-latest"
         ];
-        for (const fb of fallbacks) {
-          if (fb === currentModel) continue;
+        const tried = new Set([currentModel]);
+        for (const cand of base) {
+          if (tried.has(cand)) continue;
+          tried.add(cand);
           const r2 = await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
             headers: {
@@ -920,18 +1699,15 @@ You currently have access to the following runtime tools (enumerate ONLY when as
               "anthropic-version": "2023-06-01",
               "content-type": "application/json",
             },
-            body: JSON.stringify({ ...body, model: fb }),
+            body: JSON.stringify({ ...body, model: cand }),
           });
           if (r2.ok) {
-            model = fb;
+            model = cand;
             return await r2.json();
           }
         }
       }
-      const txt = await r.text().catch(() => "");
-      throw new Error(
-        `Anthropic upstream error ${r.status} ${txt.slice(0, 160)}`
-      );
+      throw new Error(`Anthropic upstream error ${r.status}: ${txt.slice(0,180)}`);
     }
     return await r.json();
   }
@@ -965,7 +1741,8 @@ You currently have access to the following runtime tools (enumerate ONLY when as
           id: toolId,
           iteration: iter,
         });
-        const def = TOOL_DEFS[toolName];
+  const originalName = mapAnthropicToolNameBack(toolName);
+  const def = TOOL_DEFS[originalName];
         if (!def) {
           send({
             type: "tool_error",
@@ -1127,15 +1904,21 @@ For capability/tool questions: list ONLY the tools above with brief descriptions
       body: JSON.stringify(body),
     });
     if (!r.ok) {
-      // Retry fallbacks on 404 model not found
-      if (r.status === 404 && /not_found_error/.test(await r.clone().text())) {
-        const tried = [currentModel];
-        const candidates = [
+      let details = await r.text().catch(()=>"");
+      if (r.status === 404) {
+        const envRaw = process.env.ANTHROPIC_MODEL_CANDIDATES;
+        const base = envRaw ? envRaw.split(/[,\s]+/).filter(Boolean) : [
+          "claude-3-5-sonnet",
           "claude-3-5-sonnet-latest",
+          "claude-3-5-haiku",
           "claude-3-5-haiku-latest",
-          "claude-3-opus-latest",
-        ].filter((m) => !tried.includes(m));
-        for (const cand of candidates) {
+          "claude-3-opus",
+          "claude-3-opus-latest"
+        ];
+        const tried = new Set([currentModel]);
+        for (const cand of base) {
+          if (tried.has(cand)) continue;
+          tried.add(cand);
           const r2 = await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
             headers: {
@@ -1145,17 +1928,10 @@ For capability/tool questions: list ONLY the tools above with brief descriptions
             },
             body: JSON.stringify({ ...body, model: cand }),
           });
-          if (r2.ok) {
-            currentModel = cand; // update outer variable so response JSON reflects working model
-            return await r2.json();
-          }
+          if (r2.ok) { currentModel = cand; return await r2.json(); }
         }
       }
-      let details = "";
-      try {
-        details = await r.text();
-      } catch {}
-      throw new Error(`Anthropic upstream error ${r.status}: ${details}`);
+      throw new Error(`Anthropic upstream error ${r.status}: ${details.slice(0,200)}`);
     }
     return await r.json();
   }
@@ -1273,12 +2049,13 @@ app.post("/admin/tools/register", express.json(), async (req, res) => {
     const def = { name, description: description || "", inputSchema, handler };
     addTool(def);
 
-    // Register on active session servers so new tools are available immediately
-    for (const srv of sessionServers.values()) {
+    // Register on active session servers (attach to underlying MCP server instance)
+    for (const [, entry] of sessionServers.entries()) {
       try {
-        srv.tool(def.name, def.description, def.inputSchema, def.handler);
+        entry.server?.tool?.(def.name, def.description, def.inputSchema, def.handler);
       } catch (err) {
-        /* ignore per-server register errors */
+        // Non-fatal; continue
+        console.warn('[admin/tools/register] failed attaching tool to server', entry.name, err?.message || err);
       }
     }
 
@@ -1294,6 +2071,11 @@ app.get("/admin/tools", (req, res) => {
   } catch (e) {
     return res.status(500).json({ error: String(e?.message || e) });
   }
+});
+
+// Simple health endpoint for tool invocation tests
+app.get('/health', (req, res) => {
+  res.json({ ok: true, ts: Date.now(), status: 'healthy' });
 });
 
 app.delete("/admin/tools/:name", (req, res) => {

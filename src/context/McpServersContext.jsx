@@ -63,6 +63,10 @@ export function McpServersProvider({ children }) {
         try { localStorage.removeItem('mcp_active_server'); } catch {}
         setActiveServerId(null);
       }
+      // Reset activeServerId if stale (no longer exists)
+      if (activeServerId && !cleaned.find(s => s.id === activeServerId)) {
+        setActiveServerId(cleaned.length ? cleaned[0].id : null);
+      }
       if (!activeServerId && cleaned.length) setActiveServerId(cleaned[0].id);
     } catch (e) { setError(String(e.message || e)); }
     finally { setLoadingServers(false); }
@@ -72,6 +76,11 @@ export function McpServersProvider({ children }) {
 
   const addServer = useCallback(async (name, baseUrl, type='embedded') => {
     setError(null);
+  // Guard: external/filesystem creation must be via mcpServers.json + /admin/mcp/reload; surface helpful error
+  if (type === 'external' || type === 'filesystem') {
+    setError('Use mcpServers.json + Reload for external/filesystem servers.');
+    throw new Error('Manual external/filesystem creation disabled');
+  }
   const resp = await fetch(buildUrl('/api/mcp/servers'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, baseUrl, type }) });
     if (!resp.ok) throw new Error(`Add server failed ${resp.status}`);
     const text = await resp.text();
@@ -132,7 +141,13 @@ export function McpServersProvider({ children }) {
         recreated.push(id);
         try { localStorage.setItem(priorIdsKey, JSON.stringify(recreated)); } catch {}
         if (stale) {
-          const preservedType = stale.type === 'filesystem-degraded' ? 'filesystem' : (stale.type || 'embedded');
+          // Skip re-create for external/filesystem types; they must be managed via config
+          if (['external','filesystem','filesystem-inproc','filesystem-degraded'].includes(stale.type)) {
+            console.info('[MCP] skipping client-side re-create for', stale.type, '; manage via mcpServers.json');
+            setError('Edit mcpServers.json and use Reload to manage external/filesystem servers.');
+            return;
+          }
+          const preservedType = stale.type || 'embedded';
           try {
             const addResp = await fetch(buildUrl('/api/mcp/servers'), {
               method:'POST',
@@ -150,7 +165,7 @@ export function McpServersProvider({ children }) {
                   return next;
                 });
                 setActiveServerId(data.server.id);
-                console.info('[MCP] re-created server id', id, '->', data.server.id);
+                console.info('[MCP] re-created embedded server id', id, '->', data.server.id);
                 // Retry once with new id
                 try {
                   const retry = await fetch(buildUrl(`/api/mcp/servers/${data.server.id}/tools`));

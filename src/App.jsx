@@ -1,33 +1,31 @@
-import { useState, useRef, useEffect } from "react";
+import { useRef, useState, useEffect } from "react";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { McpServersProvider, useMcpServers } from "./context/McpServersContext";
 import ServerManager from "./components/MCPServers/ServerManager";
 import ToolInvoker from "./components/MCPServers/ToolInvoker";
-import ToolLog from "./components/ToolLog/ToolLog";
-import { Assistant as AnthropicAssistant } from "./assistants/anthropic"; // kept for direct calls if needed
-import { runAnthropicStream } from "./assistants/anthropicStreamClient.js";
+// Removed ToolLog, Chat, Controls per simplified UI requirement
 import { Loader } from "./components/Loader/Loader";
-import { Chat } from "./components/Chat/Chat";
-import { Controls } from "./components/Controls/Controls";
 import Login from "./components/Login/Login";
 import styles from "./App.module.css";
-
+import { Chat } from "./components/Chat/Chat";
+import { Controls } from "./components/Controls/Controls";
+import { runAnthropicStream } from "./assistants/anthropicStreamClient.js";
 function AppInner() {
-  // Single provider: Anthropic (with server-side tool calling)
-  const assistant = new AnthropicAssistant();
+  const { user, signOut, loading } = useAuth();
+  const { activeServerId, servers } = useMcpServers();
+  const [showManager, setShowManager] = useState(false);
   const [messages, setMessages] = useState([]);
-  const [pendingSteps, setPendingSteps] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
-  const { user, signOut, loading } = useAuth();
+  const abortRef = useRef(null);
+  const [currentModel, setCurrentModel] = useState("");
   const [sessionId, setSessionId] = useState(null);
 
-  // Pull same sessionId Chat component uses (localStorage key chat_session_id)
+  // Ensure sessionId exists (memory continuity)
   useEffect(() => {
     try {
       const existing = window.localStorage.getItem('chat_session_id');
-      if (existing) setSessionId(existing);
-      else {
+      if (existing) setSessionId(existing); else {
         const id = crypto.randomUUID();
         window.localStorage.setItem('chat_session_id', id);
         setSessionId(id);
@@ -35,213 +33,59 @@ function AppInner() {
     } catch {}
   }, []);
 
-  function addMessage(message) {
-    setMessages((prevMessages) => [...prevMessages, message]);
-  }
+  function addMessage(m){ setMessages(prev => [...prev, m]); }
 
-  const [currentModel, setCurrentModel] = useState('');
-
-  const abortRef = useRef(null);
-
-  function handleCancelStream() {
-    if (abortRef.current) {
-      abortRef.current.abort();
+  function handleToolResult(result){
+    if (result == null) return;
+    if (typeof result === 'string') { addMessage({ role:'assistant', content: result }); return; }
+    if (result && typeof result === 'object') {
+      if (result.error) { addMessage({ role:'system', content: 'Tool error: '+ result.error }); return; }
+      const txt = result.text || result.summary || JSON.stringify(result).slice(0,400);
+      addMessage({ role:'assistant', content: txt });
     }
   }
 
   async function handleContentSend(content, opts = {}) {
-    const SHOW_TOOL_STEPS = false; // toggle to surface tool step summary as a single message
-    addMessage({ content, role: "user" });
-    setIsLoading(true);
-    setIsStreaming(true);
-    setPendingSteps([]);
-    let assistantIdxRef = -1;
-    const stepsLocal = [];
-    abortRef.current = new AbortController();
+    addMessage({ role:'user', content });
+    setIsLoading(true); setIsStreaming(true); abortRef.current = new AbortController();
+    let assistantIndex = -1;
     try {
       await runAnthropicStream({
         prompt: content,
         model: opts.model,
         forceEnableTools: opts.enableTools,
-        signal: abortRef.current.signal,
         sessionId,
+        signal: abortRef.current.signal,
         onEvent: (evt) => {
           if (evt.type === 'assistant_text') {
-            if (assistantIdxRef === -1) {
-              setMessages(prev => {
-                assistantIdxRef = prev.length; // index of new assistant message
-                return [...prev, { role: 'assistant', content: evt.text }];
-              });
+            if (assistantIndex === -1) {
+              setMessages(prev => { assistantIndex = prev.length; return [...prev, { role:'assistant', content: evt.text }]; });
             } else {
-              setMessages(prev => prev.map((m,i)=> i===assistantIdxRef ? { ...m, content: m.content + evt.text } : m));
+              setMessages(prev => prev.map((m,i)=> i===assistantIndex ? { ...m, content: m.content + evt.text } : m));
             }
           } else if (evt.type === 'model_used') {
-            setCurrentModel(evt.model || opts.model || '');
-          } else if (evt.type === 'tool_use' || evt.type === 'tool_result' || evt.type === 'tool_error') {
-            stepsLocal.push(evt);
-            setPendingSteps(prev => [...prev, evt]);
+            setCurrentModel(evt.model || '');
+          } else if (evt.type === 'tool_result') {
+            addMessage({ role:'assistant', content: `Tool ${evt.tool} finished.` });
+          } else if (evt.type === 'tool_error') {
+            addMessage({ role:'system', content: `Tool ${evt.tool} error: ${evt.error}` });
           } else if (evt.type === 'error') {
-            addMessage({ role: 'system', content: 'Error: ' + evt.error });
-          } else if (evt.type === 'done') {
-            if (SHOW_TOOL_STEPS && stepsLocal.length) {
-              const stepSummary = stepsLocal.map(s => {
-                if (s.type === 'tool_use') return `→ Using ${s.tool} ${JSON.stringify(s.args)}`;
-                if (s.type === 'tool_result') return `✔ ${s.tool} finished`;
-                if (s.type === 'tool_error') return `✖ Error in ${s.tool}: ${s.error}`;
-                return '';
-              }).join('\n');
-              addMessage({ role: 'tool', content: stepSummary });
-            }
+            addMessage({ role:'system', content: 'Stream error: '+ evt.error });
           }
         }
       });
     } catch (e) {
-      addMessage({ role: 'system', content: 'Sorry, I could not process your request. ' + String(e?.message || e) });
+      addMessage({ role:'system', content: 'Request failed: '+ String(e?.message || e) });
     } finally {
-      setIsLoading(false);
-      setIsStreaming(false);
-      abortRef.current = null;
+      setIsLoading(false); setIsStreaming(false); abortRef.current = null;
     }
   }
-  const { activeServerId } = useMcpServers();
+
+  function handleCancelStream(){ if (abortRef.current) abortRef.current.abort(); }
 
   async function handleLogout() {
     await signOut();
-    try {
-      localStorage.removeItem("auth_email");
-    } catch {}
-  }
-
-  /**
-   * ✅ Fixed: prefer refined text; keep raw data in console only.
-   * Accepts either:
-   *  - string (already refined)
-   *  - { text, toolRaw, ... } from ToolRunButton
-   *  - legacy { toolResult, anthropic } / { anthropicError }
-   */
-  function handleToolResult(result) {
-    if (result == null) {
-      addMessage({ role: "assistant", content: "[No result returned]" });
-      return;
-    }
-
-    // Auto-summarize raw HTML bodies if Anthropic text missing
-    const maybeAutoSummarizeHtml = async (raw) => {
-      try {
-        if (!raw) return null;
-        const str = typeof raw === 'string' ? raw : (raw.body || '');
-        if (typeof str !== 'string') return null;
-        if (!/<html[\s>]/i.test(str) && !/<head[\s>]/i.test(str)) return null;
-        const { summarizeWithAnthropic } = await import('./assistants/summarizeWithAnthropic.js');
-        const summarized = await summarizeWithAnthropic({
-          toolName: 'http_get',
-          toolOutput: raw,
-          userPrompt: lastUserContent,
-        });
-        return summarized;
-      } catch { return null; }
-    };
-
-    // New ToolRunButton shape
-    if (
-      typeof result === "object" &&
-      ("text" in result || "toolRaw" in result)
-    ) {
-      const refined =
-        typeof result.text === "string" && result.text.trim()
-          ? result.text.trim()
-          : null;
-      if (refined) {
-        addMessage({ role: "assistant", content: refined });
-      } else {
-        // Fallback if refined text is missing
-        const fallback =
-          (result.toolRaw && typeof result.toolRaw === "object"
-            ? result.toolRaw.extract || result.toolRaw.body
-            : null) || JSON.stringify(result.toolRaw ?? result);
-        maybeAutoSummarizeHtml(result.toolRaw).then((summ) => {
-          addMessage({ role: "assistant", content: summ || fallback });
-        });
-      }
-      try {
-        // eslint-disable-next-line no-console
-        console.debug("[Tool raw]", result.toolRaw);
-      } catch {}
-      return;
-    }
-
-    // Legacy worker-integrated shape
-    if (
-      typeof result === "object" &&
-      ("anthropic" in result || "anthropicError" in result)
-    ) {
-      try {
-        if (result.anthropic)
-          console.debug("[Anthropic payload]", result.anthropic);
-      } catch {}
-
-      if (result.anthropic) {
-        const anth = result.anthropic;
-        const composed =
-          typeof anth.text === "string" && anth.text.trim()
-            ? anth.text.trim()
-            : Array.isArray(anth.content)
-              ? anth.content
-                  .filter(
-                    (c) => c && c.type === "text" && typeof c.text === "string"
-                  )
-                  .map((c) => c.text)
-                  .join("\n")
-              : null;
-
-        if (composed && composed.trim()) {
-          addMessage({ role: "assistant", content: composed.trim() });
-        } else {
-          const fallback =
-            (result.toolResult && typeof result.toolResult === "object"
-              ? result.toolResult.extract || result.toolResult.body
-              : null) || JSON.stringify(result.toolResult ?? result);
-          maybeAutoSummarizeHtml(result.toolResult).then((summ) => {
-            addMessage({ role: "assistant", content: summ || fallback });
-          });
-        }
-      } else if (result.anthropicError) {
-        addMessage({
-          role: "assistant",
-          content: `Anthropic integration failed: ${result.anthropicError}`,
-        });
-      }
-      try {
-        console.debug("[Tool result]", result.toolResult);
-      } catch {}
-      return;
-    }
-
-    // Other shapes / strings
-    if (typeof result === "string") {
-      // Attempt auto summarization if raw HTML
-      if (/<html[\s>]/i.test(result)) {
-        maybeAutoSummarizeHtml(result).then((summ) => {
-          addMessage({ role: "assistant", content: summ || result });
-        });
-        return;
-      }
-      addMessage({ role: "assistant", content: result });
-      return;
-    }
-    if (result?.result?.content && Array.isArray(result.result.content)) {
-      const textParts = result.result.content.map((c) =>
-        c && typeof c === "object" && "text" in c ? c.text : JSON.stringify(c)
-      );
-      addMessage({ role: "assistant", content: textParts.join("\n") });
-      return;
-    }
-    if (result?.result) {
-      addMessage({ role: "assistant", content: JSON.stringify(result.result) });
-      return;
-    }
-
-    addMessage({ role: "assistant", content: JSON.stringify(result) });
+    try { localStorage.removeItem("auth_email"); } catch {}
   }
 
   if (loading) {
@@ -265,58 +109,50 @@ function AppInner() {
 
   return (
     <div className={styles.App}>
-      {isLoading && <Loader />}
       <header className={styles.HeaderRow}>
         <div className={styles.Header}>
-          <img
-            className={styles.Logo}
-            src="./chat-bot.png"
-            alt="Chatbot Logo"
-          />
-          <h2 className={styles.Title}>AI Chatbot</h2>
-          {currentModel && (
-            <span style={{ marginLeft:'0.75rem', fontSize:'0.65rem', padding:'2px 6px', background:'#222', border:'1px solid #333', borderRadius:6, color:'#aaa' }}>
-              Model: {currentModel}
-            </span>
-          )}
+          <img className={styles.Logo} src="./chat-bot.png" alt="Chatbot Logo" />
+          <h2 className={styles.Title}>MCP Manager</h2>
         </div>
-        <button onClick={handleLogout} className={styles.LogoutButton}>
-          Logout
-        </button>
+        <button onClick={handleLogout} className={styles.LogoutButton}>Logout</button>
       </header>
-
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "380px 1fr",
-          gap: "1rem",
-          width: "100%",
-          height: "100%",
-        }}
-      >
-        <div style={{ overflowY: "auto", maxHeight: "85vh" }}>
-          <ServerManager />
-          <ToolInvoker onResult={handleToolResult} />
-          <ToolLog />
-        </div>
-
-        <div className={styles.ChatContainer}>
-          {/* No need to pass callTool; Chat runs its own tool calls and returns only refined text */}
+      <div style={{ padding: '1rem', display:'grid', gap:'1rem', gridTemplateColumns: showManager ? '380px 1fr' : '1fr' }}>
+        {!showManager && (
+          <button
+            style={{ padding:'0.7rem 1.1rem', fontSize:'0.9rem', background:'#333', color:'#fff', border:'1px solid #444', borderRadius:8, cursor:'pointer' }}
+            onClick={()=> setShowManager(true)}
+          >
+            Open MCP Servers & Tools
+          </button>
+        )}
+        {showManager && (
+          <div style={{ display:'flex', flexDirection:'column', gap:'0.75rem' }}>
+            <div style={{ overflowY:'auto', maxHeight:'60vh' }}>
+              <ServerManager />
+              <ToolInvoker />
+            </div>
+            <div style={{ alignSelf:'start' }}>
+              <button
+                style={{ padding:'0.45rem 0.75rem', fontSize:'0.7rem', background:'#222', color:'#ddd', border:'1px solid #333', borderRadius:6, cursor:'pointer', marginBottom:'0.6rem' }}
+                onClick={()=> setShowManager(false)}
+              >Close Panel</button>
+              <div style={{ fontSize:'0.65rem', opacity:0.75 }}>
+                Edit <code>mcpServers.json</code> in your workspace to modify auto-spawn servers. Restart backend after changes.
+              </div>
+            </div>
+          </div>
+        )}
+        <div style={{ minHeight:'60vh', border:'1px solid #2a2a2a', borderRadius:8, padding:'0.75rem', background:'#181818' }}>
           <Chat
             messages={messages}
             activeServerId={activeServerId}
+            activeServerName={servers.find(s=> s.id===activeServerId)?.name || ''}
             onToolResult={handleToolResult}
             sessionId={sessionId}
           />
         </div>
       </div>
-
-      <Controls
-        isDisabled={isLoading}
-        isStreaming={isStreaming}
-        onSend={handleContentSend}
-        onCancel={handleCancelStream}
-      />
+      <Controls isDisabled={isLoading} isStreaming={isStreaming} onSend={handleContentSend} onCancel={handleCancelStream} />
     </div>
   );
 }

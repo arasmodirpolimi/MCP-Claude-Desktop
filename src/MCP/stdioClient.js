@@ -80,7 +80,7 @@ export class StdioMcpClient {
     // Standard MCP initialize per spec; adapt if server expects different shape
     const result = await this._send('initialize', {
       clientInfo: { name: 'local-host', version: '0.1.0' },
-      protocols: ['mcp'],
+      protocolVersion: '2024-11-05', // include explicit protocolVersion to satisfy server schema
       capabilities: { resources: {}, tools: {} }
     });
     this.initialized = true;

@@ -1,5 +1,21 @@
 import { z } from 'zod';
 
+/**
+ * Dynamic Tool Registry
+ * ---------------------
+ * All former static / pre-registered tools have been removed to ensure a purely
+ * dynamic environment. On server boot the registry starts empty. Tools can be
+ * added at runtime via:
+ *   1. External MCP servers (their tools are proxied, not inserted here)
+ *   2. The admin HTTP endpoint POST /admin/tools/register which calls addTool()
+ *   3. Direct programmatic calls to addTool() from custom initialization code
+ *
+ * This file intentionally contains NO default addTool(...) invocations so that
+ * deployments never expose unintended capabilities. If you need a default
+ * tool, create a separate initializer module and call addTool there, or use an
+ * environment-driven configuration step.
+ */
+
 // Tool usage log (in-memory). Each entry: { name, args, startedAt, finishedAt, error, summary }
 const TOOL_USAGE_LOG = [];
 
@@ -10,6 +26,11 @@ export const TOOL_DEFS = {};
 export function addTool(def) {
   if (!def || typeof def !== 'object') throw new Error('Invalid tool definition');
   if (!def.name || typeof def.name !== 'string') throw new Error('Tool definition must include a string `name`');
+  // Preserve optional origin for later pruning (e.g. when external MCP server removed)
+  if (def.origin && typeof def.origin === 'string') {
+    def.__origin = def.origin; // internal marker (avoid exposing externally unintentionally)
+    delete def.origin; // normalize public shape
+  }
   TOOL_DEFS[def.name] = def;
   return def;
 }
@@ -18,6 +39,19 @@ export function removeTool(name) {
   if (!name || typeof name !== 'string') return false;
   if (TOOL_DEFS[name]) { delete TOOL_DEFS[name]; return true; }
   return false;
+}
+
+// Bulk removal helper: prune tools that originated from a given server name
+export function removeToolsByOrigin(originName) {
+  if (!originName) return 0;
+  let removed = 0;
+  for (const [name, def] of Object.entries(TOOL_DEFS)) {
+    if (def?.__origin === originName || (name.startsWith(originName + ':'))) {
+      delete TOOL_DEFS[name];
+      removed++;
+    }
+  }
+  return removed;
 }
 
 export function listToolDefs() {
@@ -49,7 +83,12 @@ export function buildOpenAiTools() {
 
 // Map MCP tool defs to Anthropic tool schema
 export function buildAnthropicTools() {
-  return Object.values(TOOL_DEFS).map(def => {
+  // Reset mapping each build to avoid stale entries when tools removed
+  globalThis.__anthropicToolNameMap = { originalToSanitized: new Map(), sanitizedToOriginal: new Map() };
+  const map = globalThis.__anthropicToolNameMap;
+  const usedSanitized = new Set();
+  const tools = [];
+  for (const def of Object.values(TOOL_DEFS)) {
     const shape = (def.inputSchema)._def.shape();
     const properties = {}; const required = [];
     for (const [key, schema] of Object.entries(shape)) {
@@ -58,8 +97,32 @@ export function buildAnthropicTools() {
       properties[key] = { type: typeMap[t] || 'string', description: schema.description || '' };
       if (!schema.isOptional()) required.push(key);
     }
-    return { name: def.name, description: def.description, input_schema: { type: 'object', properties, required } };
-  });
+    let original = def.name;
+    let sanitized = original;
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sanitized)) sanitized = original.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0,128);
+    if (map.sanitizedToOriginal.has(sanitized) && map.sanitizedToOriginal.get(sanitized) !== original) {
+      let i = 2; let candidate = sanitized.slice(0,120) + '_' + i;
+      while (usedSanitized.has(candidate)) { i++; candidate = sanitized.slice(0,120) + '_' + i; }
+      sanitized = candidate;
+    }
+    map.originalToSanitized.set(original, sanitized);
+    map.sanitizedToOriginal.set(sanitized, original);
+    usedSanitized.add(sanitized);
+    tools.push({ name: sanitized, description: def.description, input_schema: { type: 'object', properties, required } });
+  }
+  return tools;
+}
+
+export function mapAnthropicToolNameBack(name) {
+  if (!globalThis.__anthropicToolNameMap) return name;
+  const m = globalThis.__anthropicToolNameMap.sanitizedToOriginal;
+  return m.get(name) || name;
+}
+
+export function mapAnthropicToolNameForward(original) {
+  if (!globalThis.__anthropicToolNameMap) return original;
+  const m = globalThis.__anthropicToolNameMap.originalToSanitized;
+  return m.get(original) || original;
 }
 
 // Expose log accessors
