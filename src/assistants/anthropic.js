@@ -34,8 +34,10 @@ function join(base, path) {
 
 export class Assistant {
   #model;
-  constructor(model = "claude-3-5-sonnet-latest") {
+  #sessionId;
+  constructor(model = "claude-3-5-sonnet-latest", { sessionId } = {}) {
     this.#model = model;
+    this.#sessionId = typeof sessionId === 'string' ? sessionId : null;
   }
 
   /**
@@ -46,12 +48,9 @@ export class Assistant {
     const url = join(rawBase, "/anthropic/ai/chat");
     const headers = { "content-type": "application/json" };
     if (options?.forceEnableTools) headers["x-force-enable-tools"] = "1";
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ prompt: content, model: this.#model }),
-    });
+    const body = { prompt: content, model: this.#model };
+    if (options.sessionId || this.#sessionId) body.sessionId = options.sessionId || this.#sessionId;
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
     if (!res.ok) {
       let text = "";
       try {
@@ -75,16 +74,9 @@ export class Assistant {
     if (options?.forceEnableTools) headers["x-force-enable-tools"] = "1";
 
     const controller = options.signal instanceof AbortSignal ? null : (options.signal ? null : null);
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        prompt: content,
-        model: this.#model,
-        max_tokens: 1024,
-      }),
-      signal: options.signal
-    });
+    const body = { prompt: content, model: this.#model, max_tokens: 1024 };
+    if (options.sessionId || this.#sessionId) body.sessionId = options.sessionId || this.#sessionId;
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: options.signal });
     if (!res.ok || !res.body) {
       let text = "";
       try {
@@ -113,13 +105,9 @@ export class Assistant {
     try {
       const headers = { "content-type": "application/json" };
       if (options?.forceEnableTools) headers["x-force-enable-tools"] = "1";
-
-      res = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ prompt: content, model: this.#model }),
-        signal: options.signal
-      });
+      const body = { prompt: content, model: this.#model };
+      if (options.sessionId || this.#sessionId) body.sessionId = options.sessionId || this.#sessionId;
+      res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: options.signal });
     } catch {
       // Immediate network fallback
       yield* this.#fallbackNonStream(content, options);
@@ -164,12 +152,9 @@ export class Assistant {
       const fbUrl = join(rawBase, "/anthropic/ai/chat");
       const headers = { "content-type": "application/json" };
       if (options?.forceEnableTools) headers["x-force-enable-tools"] = "1";
-
-      const r = await fetch(fbUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ prompt: content, model: this.#model }),
-      });
+      const body = { prompt: content, model: this.#model };
+      if (options.sessionId || this.#sessionId) body.sessionId = options.sessionId || this.#sessionId;
+      const r = await fetch(fbUrl, { method: "POST", headers, body: JSON.stringify(body) });
       if (r.ok) {
         const data = await r.json();
         const text = data.text || data.error || "[No text]";
@@ -187,15 +172,9 @@ export class Assistant {
       const headers2 = { "content-type": "application/json" };
       if (options?.forceEnableTools) headers2["x-force-enable-tools"] = "1";
 
-      const r2 = await fetch(basicUrl, {
-        method: "POST",
-        headers: headers2,
-        body: JSON.stringify({
-          prompt: content,
-          model: this.#model,
-          max_tokens: 512,
-        }),
-      });
+      const body2 = { prompt: content, model: this.#model, max_tokens: 512 };
+      if (options.sessionId || this.#sessionId) body2.sessionId = options.sessionId || this.#sessionId;
+      const r2 = await fetch(basicUrl, { method: "POST", headers: headers2, body: JSON.stringify(body2) });
       if (r2.ok && r2.body) {
         let agg = "";
         await ensureSSEParser();

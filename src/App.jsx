@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { McpServersProvider, useMcpServers } from "./context/McpServersContext";
 import ServerManager from "./components/MCPServers/ServerManager";
@@ -20,6 +20,20 @@ function AppInner() {
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const { user, signOut, loading } = useAuth();
+  const [sessionId, setSessionId] = useState(null);
+
+  // Pull same sessionId Chat component uses (localStorage key chat_session_id)
+  useEffect(() => {
+    try {
+      const existing = window.localStorage.getItem('chat_session_id');
+      if (existing) setSessionId(existing);
+      else {
+        const id = crypto.randomUUID();
+        window.localStorage.setItem('chat_session_id', id);
+        setSessionId(id);
+      }
+    } catch {}
+  }, []);
 
   function addMessage(message) {
     setMessages((prevMessages) => [...prevMessages, message]);
@@ -50,6 +64,7 @@ function AppInner() {
         model: opts.model,
         forceEnableTools: opts.enableTools,
         signal: abortRef.current.signal,
+        sessionId,
         onEvent: (evt) => {
           if (evt.type === 'assistant_text') {
             if (assistantIdxRef === -1) {
@@ -291,6 +306,7 @@ function AppInner() {
             messages={messages}
             activeServerId={activeServerId}
             onToolResult={handleToolResult}
+            sessionId={sessionId}
           />
         </div>
       </div>

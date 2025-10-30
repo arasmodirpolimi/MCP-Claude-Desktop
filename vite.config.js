@@ -13,7 +13,10 @@ export default defineConfig({
       "/mcp": { target: "http://localhost:3100", changeOrigin: true },
       "/anthropic": { target: "http://localhost:3100", changeOrigin: true },
       "/api": { target: "http://localhost:3100", changeOrigin: true },
-      "/admin": { target: "http://localhost:3100", changeOrigin: true }
+      "/admin": { target: "http://localhost:3100", changeOrigin: true },
+      // Memory endpoints were not proxied previously; without this Vite returns index.html
+      // causing Unexpected token '<' when client expects JSON.
+      "/memory": { target: "http://localhost:3100", changeOrigin: true }
     }
   },
 });

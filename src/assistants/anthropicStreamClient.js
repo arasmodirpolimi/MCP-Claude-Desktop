@@ -10,8 +10,8 @@
 
 import { Assistant } from './anthropic.js';
 
-export async function runAnthropicStream({ prompt, model = 'claude-3-5-sonnet-latest', forceEnableTools = true, onEvent, signal }) {
-  const assistant = new Assistant(model);
+export async function runAnthropicStream({ prompt, model = 'claude-3-5-sonnet-latest', forceEnableTools = true, onEvent, signal, sessionId }) {
+  const assistant = new Assistant(model, { sessionId });
   let sawAssistantText = false;
   try {
     for await (const evt of assistant.chatStreamToolAware(prompt, { forceEnableTools, signal })) {
@@ -43,7 +43,7 @@ export async function runAnthropicStream({ prompt, model = 'claude-3-5-sonnet-la
   // Fallback request if none streamed
   if (!sawAssistantText && !signal?.aborted) {
     try {
-      const text = await assistant.chat(prompt, { forceEnableTools });
+  const text = await assistant.chat(prompt, { forceEnableTools, sessionId });
       if (text) onEvent?.({ type: 'assistant_text', text });
       onEvent?.({ type: 'done', text });
     } catch (e) {

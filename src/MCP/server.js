@@ -122,7 +122,13 @@ function storeMemoryMessage(sessionId, role, content) {
   if (!['user','assistant','system'].includes(role)) return { error: 'Invalid role' };
   if (typeof content !== 'string' || !content.trim()) return { error: 'Invalid content' };
   const entry = memoryMap.get(sessionId) || { messages: [], summaries: [], chars: 0 };
-  entry.messages.push({ role, content, ts: Date.now() });
+  const now = Date.now();
+  const last = entry.messages[entry.messages.length - 1];
+  // Deduplicate identical consecutive messages of same role within short window (5s)
+  if (last && last.role === role && last.content === content && (now - last.ts) < 5000) {
+    return { ok: true, sessionId, deduped: true, counts: { messages: entry.messages.length, summaries: entry.summaries.length }, chars: entry.chars };
+  }
+  entry.messages.push({ role, content, ts: now });
   entry.chars = estimateChars(entry.messages) + estimateChars(entry.summaries);
   if (entry.chars > MAX_MEMORY_CHARS) {
     summarizeOldMessages(entry);
@@ -536,6 +542,7 @@ app.post('/anthropic/chat', async (req, res) => {
     // Store user message before model call
     storeMemoryMessage(sessionId, 'user', prompt);
   }
+  let aggregatedAssistant = '';
   if (!apiKey) {
     // Mock stream fallback for local dev without key
     res.setHeader('Content-Type','text/event-stream');

@@ -75,9 +75,11 @@ const WELCOME_MESSAGE_GROUP = [
   { role: "assistant", content: "Hello! How can I assist you right now?" },
 ];
 
-export function Chat({ messages, activeServerId, onToolResult, autoRunTools = true }) {
+export function Chat({ messages, activeServerId, onToolResult, autoRunTools = true, sessionId: externalSessionId }) {
   const messagesEndRef = useRef(null);
+  // Use externally provided sessionId (source of truth) or fall back once
   const [sessionId] = useState(() => {
+    if (typeof externalSessionId === 'string' && externalSessionId.length > 10) return externalSessionId;
     try {
       const existing = typeof window !== 'undefined' ? window.localStorage.getItem('chat_session_id') : null;
       if (existing && existing.length > 10) return existing;
@@ -87,6 +89,12 @@ export function Chat({ messages, activeServerId, onToolResult, autoRunTools = tr
     } catch { return Math.random().toString(36).slice(2); }
   });
   const [memoryStats, setMemoryStats] = useState({ messages: 0, summaries: 0, chars: 0 });
+  const [showMemoryPanel, setShowMemoryPanel] = useState(false);
+  const [memoryViewLimit, setMemoryViewLimit] = useState(12); // last N entries
+  const [memoryEntries, setMemoryEntries] = useState([]); // cached memory messages
+  const [memorySummaries, setMemorySummaries] = useState([]);
+  const [loadingMemory, setLoadingMemory] = useState(false);
+  const [memoryError, setMemoryError] = useState(null);
 
   // Robust grouping: start with one empty group, open a new group when we hit a user message
   const messagesGroups = useMemo(() => {
@@ -134,15 +142,26 @@ export function Chat({ messages, activeServerId, onToolResult, autoRunTools = tr
         const base = import.meta.env.VITE_API_BASE || '';
         const r = await fetch(`${base}/memory/${sessionId}`);
         if (r.ok) {
-          const data = await r.json();
+          const text = await r.text();
+          if (/^\s*</.test(text)) {
+            // HTML response indicates proxy misconfiguration (likely index.html)
+            if (active) setMemoryError('Memory endpoint returned HTML (proxy misconfigured)');
+            return;
+          }
+          let data; try { data = JSON.parse(text); } catch { setMemoryError('Invalid JSON from memory endpoint'); return; }
           if (active) setMemoryStats({ messages: data.messages.length, summaries: data.summaries.length, chars: data.chars });
+          // Opportunistically refresh cached memory if panel is open (lightweight incremental UX)
+          if (active && showMemoryPanel) {
+            setMemoryEntries(data.messages || []);
+            setMemorySummaries(data.summaries || []);
+          }
         }
       } catch {}
     }
     load();
     const id = setInterval(load, 8000);
     return () => { active = false; clearInterval(id); };
-  }, [sessionId]);
+  }, [sessionId, showMemoryPanel]);
 
   // Auto tool execution for structured tool_use events inserted into messages array
   useEffect(() => {
@@ -198,15 +217,85 @@ export function Chat({ messages, activeServerId, onToolResult, autoRunTools = tr
       const base = import.meta.env.VITE_API_BASE || '';
       await fetch(`${base}/memory/clear`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId }) });
       setMemoryStats({ messages: 0, summaries: 0, chars: 0 });
+      setMemoryEntries([]);
+      setMemorySummaries([]);
     } catch {}
+  }
+
+  async function loadMemorySnapshot() {
+    setLoadingMemory(true); setMemoryError(null);
+    try {
+      const base = import.meta.env.VITE_API_BASE || '';
+      const r = await fetch(`${base}/memory/${sessionId}`);
+      if (!r.ok) throw new Error(`Fetch memory failed ${r.status}`);
+      const data = await r.json();
+      setMemoryEntries(data.messages || []);
+      setMemorySummaries(data.summaries || []);
+    } catch (e) { setMemoryError(String(e.message || e)); }
+    finally { setLoadingMemory(false); }
+  }
+
+  function renderMemoryPanel() {
+    const combined = [...(memoryEntries || [])];
+    // Include summaries as synthetic entries at end (tagged)
+    (memorySummaries || []).forEach((s, i) => {
+      combined.push({ role: 'summary', content: s?.content || s?.text || s?.summary || '[summary]', createdAt: s?.createdAt || s?.timestamp || Date.now(), _isSummary: true });
+    });
+    const last = combined.slice(-memoryViewLimit);
+    return (
+      <div className={styles.MemoryPanel}>
+        <div className={styles.MemoryPanelHeader}>
+          <div style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
+            <strong style={{ fontSize:'0.75rem' }}>Memory Viewer</strong>
+            <label style={{ fontSize:'0.65rem', display:'flex', alignItems:'center', gap:4 }}>
+              Show last
+              <select value={memoryViewLimit} onChange={e=> setMemoryViewLimit(Number(e.target.value))} style={{ fontSize:'0.65rem' }}>
+                {[6,12,20,40].map(n=> <option key={n} value={n}>{n}</option>)}
+              </select>
+              entries
+            </label>
+            <button onClick={loadMemorySnapshot} disabled={loadingMemory} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>{loadingMemory ? 'Loading…' : 'Refresh'}</button>
+            <button onClick={handleClearMemory} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>Clear</button>
+          </div>
+          <button onClick={()=> setShowMemoryPanel(false)} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>Close</button>
+        </div>
+        {memoryError && <div className={styles.MemoryError}>⚠ {memoryError}</div>}
+        <div className={styles.MemoryList}>
+          {last.length === 0 && <div className={styles.MemoryEmpty}>No memory entries yet.</div>}
+          {last.map((m,i) => {
+            const role = m.role || 'unknown';
+            const isSummary = m._isSummary || role === 'summary';
+            let text = '';
+            if (typeof m.content === 'string') text = m.content;
+            else if (Array.isArray(m.content)) text = m.content.map(b => (typeof b.text === 'string' ? b.text : '')).join('\n');
+            else if (m.content && typeof m.content === 'object' && typeof m.content.text === 'string') text = m.content.text;
+            else text = JSON.stringify(m.content || '');
+            const display = text.length > 260 ? text.slice(0,260) + '…' : text;
+            return (
+              <div key={i} className={styles.MemoryItem} data-role={role} data-summary={isSummary ? '1':'0'}>
+                <div className={styles.MemoryMeta}>
+                  <span className={styles.MemoryRole}>{isSummary ? 'summary' : role}</span>
+                  {m.createdAt && <span className={styles.MemoryTime}>{new Date(m.createdAt).toLocaleTimeString()}</span>}
+                </div>
+                <div className={styles.MemoryText}><Markdown>{display}</Markdown></div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
   }
 
   return (
     <div className={styles.Chat}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
         <div style={{ fontSize:'0.7rem', opacity:0.8 }}>Session: {sessionId} • Mem msgs {memoryStats.messages} • summaries {memoryStats.summaries} • chars {memoryStats.chars}</div>
-        <button onClick={handleClearMemory} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>Clear Memory</button>
+        <div style={{ display:'flex', gap:6 }}>
+          <button onClick={()=> { if (!showMemoryPanel) loadMemorySnapshot(); setShowMemoryPanel(s=> !s); }} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>{showMemoryPanel ? 'Hide Memory' : 'View Memory'}</button>
+          <button onClick={handleClearMemory} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>Clear Memory</button>
+        </div>
       </div>
+      {showMemoryPanel && renderMemoryPanel()}
       {[WELCOME_MESSAGE_GROUP, ...messagesGroups].map((group, groupIndex) => (
         <div key={groupIndex} className={styles.Group}>
           {group.map(({ role, content }, index) => {
