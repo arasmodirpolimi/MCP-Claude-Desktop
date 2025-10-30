@@ -54,6 +54,20 @@ async function spawnServersFromConfig({ replace = false } = {}) {
   const entries = cfg?.mcpServers ? Object.entries(cfg.mcpServers) : [];
   if (!entries.length) {
     console.log("[MCP] mcpServers.json has empty mcpServers map");
+    // If replace requested, prune all existing external/filesystem servers & their bridged tools
+    if (replace) {
+      let prunedServers = 0; let prunedTools = 0;
+      for (const [id, entry] of [...sessionServers.entries()]) {
+        if (["external","filesystem","filesystem-inproc","filesystem-degraded"].includes(entry.type)) {
+          try { entry.transport.close?.(); } catch {}
+          sessionServers.delete(id);
+          prunedServers++;
+          try { prunedTools += removeToolsByOrigin(entry.name); } catch {}
+        }
+      }
+      console.log('[MCP] replace=true with empty config -> pruned servers:', prunedServers, 'pruned tools:', prunedTools);
+      return { ok: true, loaded: 0, prunedServers, prunedTools };
+    }
     return { ok: true, loaded: 0 };
   }
   // If replace is true, remove existing external servers not present in config
