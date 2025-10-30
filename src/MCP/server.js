@@ -183,11 +183,14 @@ app.post('/anthropic/chat', async (req, res) => {
     res.setHeader('Connection','keep-alive');
     res.flushHeaders?.();
     const reader = upstream.body.getReader();
+    let cancelled = false;
+    req.on('close', () => { cancelled = true; try { reader.cancel(); } catch {} });
     const decoder = new TextDecoder();
     let buffer = '';
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      if (cancelled) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split(/\n/); buffer = lines.pop() || '';
       for (const raw of lines) {
@@ -222,21 +225,73 @@ app.post('/anthropic/ai/chat-stream', async (req, res) => {
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
   res.flushHeaders?.();
-
   const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
+  // Helper to decide if tools should be invoked (heuristic)
+  const needsWeather = /\bweather\b|\bforecast\b/i.test(prompt);
+  const needsHttpGet = /https?:\/\//i.test(prompt);
+
   if (!apiKey) {
-    // Mock deterministic response
-    send({ type: 'assistant_text', text: 'Mock (no API key): ' + prompt.slice(0,80) });
+    // Mock streaming with simulated tool events
+    send({ type: 'model_used', model: 'mock-anthropic' });
+    if (needsWeather) {
+      send({ type: 'tool_use', tool: 'get_current_weather', args: { location: 'Milan', unit: 'celsius' } });
+      try {
+        const live = await getCurrentWeatherFn({ location: 'Milan' });
+        send({ type: 'tool_result', tool: 'get_current_weather', output: live });
+      } catch (e) {
+        send({ type: 'tool_error', tool: 'get_current_weather', error: String(e?.message || e) });
+      }
+    }
+    send({ type: 'assistant_text', text: 'Mock (no key). ' + (needsWeather ? 'Fetched weather. ' : '') + prompt.slice(0,120) });
     send({ type: 'done' });
     return res.end();
   }
+
+  // Phase 1: optionally run tools first (pre-call) then ask Anthropic to summarize
+  const toolOutputs = [];
+  if (needsWeather) {
+    const args = { location: 'Milan', unit: 'celsius' }; // TODO: parse location more robustly
+    send({ type: 'tool_use', tool: 'get_current_weather', args });
+    try {
+      const result = await getCurrentWeatherFn(args);
+      send({ type: 'tool_result', tool: 'get_current_weather', output: result });
+      toolOutputs.push({ role: 'assistant', content: [ { type: 'tool_result', tool_use_id: 'weather-1', content: [{ type: 'text', text: JSON.stringify(result) }] } ] });
+    } catch (e) {
+      send({ type: 'tool_error', tool: 'get_current_weather', error: String(e?.message || e) });
+    }
+  }
+  if (needsHttpGet) {
+    // Extract first URL
+    const urlMatch = /(https?:\/\/[^\s]+)/i.exec(prompt);
+    if (urlMatch) {
+      const url = urlMatch[1];
+      send({ type: 'tool_use', tool: 'http_get', args: { url, maxBytes: 8000 } });
+      try {
+        const resp = await fetch(url, { headers: { 'accept': 'text/plain, text/html' } });
+        let text = await resp.text();
+        if (text.length > 8000) text = text.slice(0,8000) + '\n...TRUNCATED';
+        const output = { status: resp.status, snippet: text.slice(0,500) };
+        send({ type: 'tool_result', tool: 'http_get', output });
+        toolOutputs.push({ role: 'assistant', content: [ { type: 'tool_result', tool_use_id: 'http_get-1', content: [{ type: 'text', text: JSON.stringify(output) }] } ] });
+      } catch (e) {
+        send({ type: 'tool_error', tool: 'http_get', error: String(e?.message || e) });
+      }
+    }
+  }
+
+  // Phase 2: stream Anthropic answer including context from tool results
   try {
     async function call(modelName) {
       return await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-        body: JSON.stringify({ model: modelName, max_tokens: 512, messages: [{ role: 'user', content: prompt }], stream: true })
+        body: JSON.stringify({
+          model: modelName,
+          max_tokens: 512,
+          messages: [ { role: 'user', content: prompt } ].concat(toolOutputs),
+          stream: true
+        })
       });
     }
     let upstream = await call(model);
@@ -256,10 +311,13 @@ app.post('/anthropic/ai/chat-stream', async (req, res) => {
     }
     send({ type: 'model_used', model });
     const reader = upstream.body.getReader();
+    let cancelled = false;
+    req.on('close', () => { cancelled = true; try { reader.cancel(); } catch {} });
     const decoder = new TextDecoder();
     let buffer = '';
     while (true) {
       const { value, done } = await reader.read(); if (done) break;
+      if (cancelled) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split(/\n/); buffer = lines.pop() || '';
       for (const raw of lines) {
@@ -268,10 +326,9 @@ app.post('/anthropic/ai/chat-stream', async (req, res) => {
         if (!line.startsWith('data:')) continue;
         try {
           const payload = JSON.parse(line.slice(5));
-          // Anthropic streaming payload shapes vary; extract text deltas
-            const delta = payload?.delta?.text || payload?.content_block?.text || payload?.text || (payload?.type === 'content_block_delta' && payload?.delta?.type === 'text_delta' ? payload?.delta?.text : '');
+          const delta = payload?.delta?.text || payload?.content_block?.text || payload?.text || (payload?.type === 'content_block_delta' && payload?.delta?.type === 'text_delta' ? payload?.delta?.text : '');
           if (delta) send({ type: 'assistant_text', text: delta });
-        } catch { /* ignore line parse */ }
+        } catch { /* ignore */ }
       }
     }
     send({ type: 'done' });

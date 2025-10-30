@@ -10,15 +10,21 @@
 
 import { Assistant } from './anthropic.js';
 
-export async function runAnthropicStream({ prompt, model = 'claude-3-5-sonnet-latest', forceEnableTools = true, onEvent }) {
+export async function runAnthropicStream({ prompt, model = 'claude-3-5-sonnet-latest', forceEnableTools = true, onEvent, signal }) {
   const assistant = new Assistant(model);
   let sawAssistantText = false;
   try {
-    for await (const evt of assistant.chatStreamToolAware(prompt, { forceEnableTools })) {
+    for await (const evt of assistant.chatStreamToolAware(prompt, { forceEnableTools, signal })) {
+      if (signal?.aborted) {
+        onEvent?.({ type: 'error', error: 'Cancelled' });
+        return;
+      }
       if (!evt || typeof evt !== 'object') continue;
       if (evt.type === 'assistant_text') {
         sawAssistantText = true;
         onEvent?.({ type: 'assistant_text', text: evt.text || '' });
+      } else if (evt.type === 'model_used') {
+        onEvent?.({ type: 'model_used', model: evt.model });
       } else if (evt.type === 'tool_use') {
         onEvent?.({ type: 'tool_use', tool: evt.tool || evt.name, args: evt.args || evt.input || {} });
       } else if (evt.type === 'tool_result') {
@@ -35,7 +41,7 @@ export async function runAnthropicStream({ prompt, model = 'claude-3-5-sonnet-la
     onEvent?.({ type: 'error', error: String(e?.message || e) });
   }
   // Fallback request if none streamed
-  if (!sawAssistantText) {
+  if (!sawAssistantText && !signal?.aborted) {
     try {
       const text = await assistant.chat(prompt, { forceEnableTools });
       if (text) onEvent?.({ type: 'assistant_text', text });

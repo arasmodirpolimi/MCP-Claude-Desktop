@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { McpServersProvider, useMcpServers } from "./context/McpServersContext";
 import ServerManager from "./components/MCPServers/ServerManager";
@@ -27,6 +27,14 @@ function AppInner() {
 
   const [currentModel, setCurrentModel] = useState('');
 
+  const abortRef = useRef(null);
+
+  function handleCancelStream() {
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+  }
+
   async function handleContentSend(content, opts = {}) {
     const SHOW_TOOL_STEPS = false; // toggle to surface tool step summary as a single message
     addMessage({ content, role: "user" });
@@ -35,11 +43,13 @@ function AppInner() {
     setPendingSteps([]);
     let assistantIdxRef = -1;
     const stepsLocal = [];
+    abortRef.current = new AbortController();
     try {
       await runAnthropicStream({
         prompt: content,
         model: opts.model,
         forceEnableTools: opts.enableTools,
+        signal: abortRef.current.signal,
         onEvent: (evt) => {
           if (evt.type === 'assistant_text') {
             if (assistantIdxRef === -1) {
@@ -75,6 +85,7 @@ function AppInner() {
     } finally {
       setIsLoading(false);
       setIsStreaming(false);
+      abortRef.current = null;
     }
   }
   const { activeServerId } = useMcpServers();
@@ -285,8 +296,10 @@ function AppInner() {
       </div>
 
       <Controls
-        isDisabled={isLoading || isStreaming}
+        isDisabled={isLoading}
+        isStreaming={isStreaming}
         onSend={handleContentSend}
+        onCancel={handleCancelStream}
       />
     </div>
   );

@@ -2,7 +2,7 @@ import { useRef, useEffect, useState } from "react";
 import TextareaAutosize from 'react-textarea-autosize';
 import styles from "./Controls.module.css";
 
-export function Controls( {isDisabled = false, onSend } ) {
+export function Controls( {isDisabled = false, isStreaming = false, onSend, onCancel } ) {
   const textareaRef = useRef(null);
   const [content, setContent] = useState("");
   const [selectedModel, setSelectedModel] = useState('claude-3-5-sonnet-latest');
@@ -67,9 +67,12 @@ export function Controls( {isDisabled = false, onSend } ) {
           onKeyDown={handleEnterPress}
         />
       </div>
-      <button className={styles.Button} disabled={isDisabled} onClick={handleContentSend}>
-        <SendIcon />
-      </button>
+      <div style={{ display:'flex', gap:'0.5rem' }}>
+        <button className={styles.Button} disabled={isDisabled || isStreaming} onClick={handleContentSend}>
+          <SendIcon />
+        </button>
+        <button className={styles.Button} style={{ background:'#442' }} disabled={!isStreaming} onClick={onCancel}>⏹</button>
+      </div>
     </div>
   );
 }

@@ -74,6 +74,7 @@ export class Assistant {
     const headers = { "content-type": "application/json" };
     if (options?.forceEnableTools) headers["x-force-enable-tools"] = "1";
 
+    const controller = options.signal instanceof AbortSignal ? null : (options.signal ? null : null);
     const res = await fetch(url, {
       method: "POST",
       headers,
@@ -82,6 +83,7 @@ export class Assistant {
         model: this.#model,
         max_tokens: 1024,
       }),
+      signal: options.signal
     });
     if (!res.ok || !res.body) {
       let text = "";
@@ -116,6 +118,7 @@ export class Assistant {
         method: "POST",
         headers,
         body: JSON.stringify({ prompt: content, model: this.#model }),
+        signal: options.signal
       });
     } catch {
       // Immediate network fallback
@@ -137,6 +140,10 @@ export class Assistant {
     try {
       await ensureSSEParser();
       for await (const evt of parseSSEReadable(res.body)) {
+        if (options.signal?.aborted) {
+          yield { type: 'error', error: 'Stream cancelled' };
+          return;
+        }
         // Pass through structured event objects to the UI
         yield evt;
       }
