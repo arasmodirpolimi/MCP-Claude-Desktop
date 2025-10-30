@@ -203,13 +203,12 @@ Add an external MCP server providing filesystem tools (read/write/list/search/et
 
 The server responds with an id; fetch tools via `/api/mcp/servers/<id>/tools`.
 
-Currently returned tools (static enumeration):
-`read_file`, `write_file`, `append_file`, `list_directory`, `create_directory`, `delete_file`, `rename`, `move`, `copy`, `search`, `stat`, `read_json`, `write_json`, `tail_file`.
+Tool discovery is now fully dynamic via MCP JSON-RPC (`initialize` + `tools/list`). No static fallback list is bundled.
 
 Security cautions:
-- Do NOT expose filesystem server publicly without sandboxing.
-- Consider running in a restricted directory.
-- Future enhancement: real MCP handshake + dynamic tool parsing (list_tools) and path allow/deny lists.
+- Do NOT expose a filesystem MCP server publicly without sandboxing.
+- Run it in a restricted working directory or container.
+- Prefer read‑only or audited tools where possible; add allow/deny path filters upstream.
 
 ## 17. Contributing
 1. Fork & branch: `git checkout -b feat/your-feature`.
@@ -345,79 +344,8 @@ For local development convenience you can still use `VITE_OPENAI_API_KEY` or `VI
 * Log tool usage (`/logs/tools`) and rotate logs.
 * Consider moving session state to Redis / Durable Object for horizontal scaling.
 
-## 22. MCP Server Deployment (Express Backend with Tools)
-This project includes a full MCP-compatible Express server (`src/MCP/server.js`) exposing:
-* `/mcp` (Streamable HTTP transport for Model Context Protocol sessions)
-* `/openai/chat` (SSE streaming proxy)
-* `/anthropic/chat` (SSE streaming proxy)
-* `/anthropic/ai/chat` and `/anthropic/ai/chat-stream` (tool-aware endpoints)
-* `/logs/tools` + `/logs/tools/clear` (diagnostics)
-
-### Required Environment Variables
-| Variable | Purpose | Example |
-|----------|---------|---------|
-| PORT | Listening port (platform may override) | 3100 |
-| ALLOWED_ORIGIN | Browser origin allowed for CORS | https://arasmodirpolimi.github.io |
-| OPENAI_API_KEY | Server-side OpenAI key | sk-... |
-| ANTHROPIC_API_KEY | Server-side Anthropic key | sk-ant-... |
-| ANTHROPIC_MODEL (optional) | Default Anthropic model override | claude-3-5-sonnet-latest |
-| OPENAI_MOCK / ANTHROPIC_MOCK (optional) | Set to `1` to enable mock mode | 1 |
-
-Never put provider keys into `VITE_` vars for production—keep them server-only.
-
-### Deploy on Render (example)
-1. Create new Web Service → connect GitHub repo.
-2. Runtime: Node 20+.
-3. Build command: `npm install`
-4. Start command: `node src/MCP/server.js`
-5. Add Environment Variables:
-	- `ALLOWED_ORIGIN=https://arasmodirpolimi.github.io`
-	- `OPENAI_API_KEY=...`
-	- `ANTHROPIC_API_KEY=...`
-6. Deploy and note the URL (e.g. `https://your-app.onrender.com`).
-
-### Deploy on Railway (similar)
-1. New Project → Deploy from GitHub.
-2. Automatically detects Node, installs dependencies.
-3. Set Variables (same as above).
-4. Ensure `Start Command` is `node src/MCP/server.js` if not auto-detected.
-
-### Frontend Configuration
-Set in GitHub Actions (Pages build) or repository secrets:
-```
-VITE_API_BASE=https://your-app.onrender.com
-VITE_MCP_BASE=https://your-app.onrender.com/mcp   # Optional if using mcpClient.js
-```
-Rebuild Pages so the bundle points to the deployed backend.
-
-### Verification Steps
-| Check | Endpoint | Expected |
-|-------|----------|----------|
-| CORS | `OPTIONS /anthropic/chat` | 204 + `Access-Control-Allow-Origin` matches Pages origin |
-| Tool streaming | `POST /anthropic/ai/chat-stream` | SSE events: `tool_use`, `tool_result`, `assistant_text` |
-| Weather tool | Prompt "weather in Milan" | Assistant emits tool events + summary |
-| MCP connect | `POST /mcp` then `GET /mcp` (SSE) | Session id header present; no 405 |
-| Logs | `GET /logs/tools` after tool use | JSON with tool call entries |
-
-### Fallback Removal
-After switching to the Express server:
-* You can keep Worker deployed for simple proxy usage, but set `VITE_API_BASE` to the Express origin for full tools.
-* The enhanced fallback logic in `anthropic.js` still works if streaming path temporarily fails (will drop to non-stream tool endpoint).
-
-### Troubleshooting
-| Symptom | Cause | Resolution |
-|---------|-------|------------|
-| 405 on `/mcp` GET | Missing initial POST to create session | Ensure client first POSTs with `mcp-session-id` header absent |
-| 404 model | Deprecated Anthropic model id | Rely on server fallback logic (already implemented) |
-| CORS blocked | ALLOWED_ORIGIN mismatch | Set exact origin (no trailing slash) and redeploy |
-| Empty weather output | Location parse failed | Provide explicit city, e.g. "Weather in Milan" |
-| Long tool latency | Upstream API slow | Consider caching weather results for short TTL |
-
-### Scaling / Next Steps
-* Use a session store (Redis) instead of in-memory Map for horizontal scaling.
-* Add rate limiting on tool endpoints.
-* Persist tool usage or chat transcripts in a database (with RLS if multi-user).
-* Enable structured tool schemas for additional tools (DB lookup, file search, etc.).
+## 22. MCP Server Deployment (Current Approach)
+The project now targets a Worker or external MCP servers using JSON-RPC. The previous Express-specific deployment instructions and static tool fallbacks have been removed. Use the Worker deployment guide below or plug in external MCP servers via the UI.
 
 
 ## 23. Cloudflare Worker Backend & Dynamic External MCP Servers (Current Implementation)

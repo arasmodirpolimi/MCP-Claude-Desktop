@@ -92,8 +92,8 @@ export async function *streamToolOnce(serverId, toolName, args = {}) {
 
 // Backwards compatible Assistant wrapper.
 export class Assistant {
-  constructor(serverId, toolName = 'get_current_weather') { this.serverId = serverId; this.toolName = toolName; }
-  async *chatStream(content) { yield* streamToolOnce(this.serverId, this.toolName, { location: content, unit: 'celsius' }); }
+  constructor(serverId) { this.serverId = serverId; }
+  async *chatStream(content) { yield* streamToolOnce(this.serverId); }
 }
 
 // HMR cleanup placeholder
