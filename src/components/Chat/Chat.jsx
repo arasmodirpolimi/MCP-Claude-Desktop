@@ -380,7 +380,7 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
                 {isStreaming && groupIndex === messagesGroups.length - 1 && index === group.length - 1 && role === 'assistant' && (
                   <span className={styles.StreamingCursor} />
                 )}
-                {suggestions.length > 0 && (
+                {autoRunTools && suggestions.length > 0 && (
                   <div style={{ marginTop: 8 }}>
                     {suggestions.map((s, idx) => (
                       <ToolRunButton
@@ -408,7 +408,7 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
       )}
       <div ref={messagesEndRef} />
       <div className={styles.BottomFade} />
-      {activeToolExecs.length > 0 && (
+      {autoRunTools && activeToolExecs.length > 0 && (
         <div className={styles.ToolExecContainer}>
           {activeToolExecs.map(exec => {
             const cls = [styles.ToolExecItem];

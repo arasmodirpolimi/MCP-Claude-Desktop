@@ -21,6 +21,7 @@ function AppInner() {
   const [currentModel, setCurrentModel] = useState("");
   const [sessionId, setSessionId] = useState(null);
   const [activeToolExecs, setActiveToolExecs] = useState([]); // [{tool, startedAt, args, status, output}]
+  // Tools always enabled now (toggle removed)
   function clearMessages() {
     // Set to empty; Chat component injects the welcome group automatically so no duplicates
     setMessages([]);
@@ -58,7 +59,7 @@ function AppInner() {
       await runAnthropicStream({
         prompt: content,
         model: opts.model,
-        forceEnableTools: opts.enableTools,
+        forceEnableTools: true,
         sessionId,
         signal: abortRef.current.signal,
         onEvent: (evt) => {
@@ -166,11 +167,17 @@ function AppInner() {
             isLoading={isLoading}
             isStreaming={isStreaming}
             activeToolExecs={activeToolExecs}
+            autoRunTools={true}
             onClearMemory={clearMessages}
           />
         </div>
       </div>
-      <Controls isDisabled={isLoading} isStreaming={isStreaming} onSend={handleContentSend} onCancel={handleCancelStream} />
+      <Controls
+        isDisabled={isLoading}
+        isStreaming={isStreaming}
+        onSend={handleContentSend}
+        onCancel={handleCancelStream}
+      />
   {/* Memory clear button triggers local chat clear by calling Chat's clear memory or App's helper (already wired via Chat) */}
     </div>
   );

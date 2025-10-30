@@ -1433,12 +1433,13 @@ app.post("/anthropic/chat", async (req, res) => {
   }
   // Prepend memory context if provided
   const memoryMessages = sessionId ? buildMemoryContext(sessionId) : [];
-  // Build dynamic tool schema + system prompt enumeration (silent unless asked)
-  const tools = buildAnthropicTools();
+  // Build dynamic tool schema only if header present (tool usage toggle)
+  const forceEnable = req.headers['x-force-enable-tools'] === '1';
+  const tools = forceEnable ? buildAnthropicTools() : [];
   const toolListForSystem = Object.values(TOOL_DEFS)
     .map((def) => `- ${def.name}: ${def.description}`)
     .join("\n");
-  const system = `You are a helpful assistant.\nRuntime tools available (list ONLY when the user explicitly asks about tools/capabilities):\n${toolListForSystem || '- (no tools registered)'}\nGuidelines:\n- Do NOT invent tools.\n- Use a tool only if it materially improves the answer or is required for fresh data.\n- If a tool is used mid conversation, respond with final answer after incorporating results.`;
+  const system = `You are a helpful assistant.\nRuntime tools available (list ONLY when the user explicitly asks about tools/capabilities):\n${forceEnable ? (toolListForSystem || '- (no tools registered)') : '- (tools disabled for this request)'}\nGuidelines:\n- Do NOT invent tools.\n- When tools are disabled, answer using existing knowledge and clarify limitations if fresh data required.`;
   if (sessionId) {
     // Store user message before model call
     storeMemoryMessage(sessionId, "user", prompt);
@@ -1648,12 +1649,13 @@ app.post("/anthropic/ai/chat-stream", async (req, res) => {
   }
 
   if (sessionId) storeMemoryMessage(sessionId, "user", prompt);
-  const tools = buildAnthropicTools();
+  const forceEnable2 = req.headers['x-force-enable-tools'] === '1';
+  const tools = forceEnable2 ? buildAnthropicTools() : [];
   const toolListForSystem = Object.values(TOOL_DEFS)
     .map((def) => `- ${def.name}: ${def.description}`)
     .join("\n");
   const system = `You are a helpful assistant.
-You currently have access to the following runtime tools (enumerate ONLY when asked):\n${toolListForSystem || "- (no tools registered)"}\nInstructions:\n- When needing external data (weather, URLs, filesystem), invoke appropriate tool with correct arguments.\n- After receiving tool results, incorporate them faithfully without fabrication.`;
+${forceEnable2 ? 'You currently have access to the following runtime tools (enumerate ONLY when asked):\n' + (toolListForSystem || '- (no tools registered)') : 'Tools are disabled for this request. Do not claim tool usage.'}\nInstructions:\n- If tools are enabled and external data is needed, invoke a tool with correct arguments.\n- If tools are disabled and the user asks you to use one, politely state they are disabled and how to enable them.`;
   let messages = (sessionId ? buildMemoryContext(sessionId) : []).concat([
     { role: "user", content: prompt },
   ]);
@@ -1867,7 +1869,8 @@ app.post("/anthropic/ai/chat", async (req, res) => {
     return res.status(400).json({ error: "Invalid prompt" });
 
   // Build Anthropic tool schema
-  const tools = buildAnthropicTools();
+  const forceEnable3 = req.headers['x-force-enable-tools'] === '1';
+  const tools = forceEnable3 ? buildAnthropicTools() : [];
   let currentModel = requestedModel;
   const steps = [];
   // Represent user prompt as content block array for consistency
@@ -1880,8 +1883,7 @@ app.post("/anthropic/ai/chat", async (req, res) => {
     .map((def) => `- ${def.name}: ${def.description}`)
     .join("\n");
   const system = `You are a helpful assistant.
-You currently have access to the following runtime tools (enumerate them ONLY when the user asks what tools/capabilities you have):\n${toolListForSystem || "- (no tools registered)"}\nIf the user:
-For capability/tool questions: list ONLY the tools above with brief descriptions; do NOT invent tools. For all other queries, reply normally. Keep answers concise and relevant.`;
+${forceEnable3 ? 'You currently have access to the following runtime tools (enumerate them ONLY when the user asks what tools/capabilities you have):\n' + (toolListForSystem || '- (no tools registered)') : 'Tools are disabled for this request. Do not list or claim capabilities.'}\nIf the user asks about capabilities: ${forceEnable3 ? 'List ONLY the tools above with brief descriptions.' : 'Explain that runtime tools are currently disabled.'} For all other queries, reply normally. Keep answers concise and relevant.`;
   let finalText = "";
 
   async function anthropicCall(toolResults = []) {

@@ -6,7 +6,6 @@ export function Controls( {isDisabled = false, isStreaming = false, onSend, onCa
   const textareaRef = useRef(null);
   const [content, setContent] = useState("");
   const [selectedModel, setSelectedModel] = useState('claude-3-5-sonnet-latest');
-  const [enableTools, setEnableTools] = useState(true);
 
 
   useEffect(() => {
@@ -21,7 +20,7 @@ export function Controls( {isDisabled = false, isStreaming = false, onSend, onCa
 
   function handleContentSend() {
     if (content.trim().length === 0) return;
-    onSend(content, { model: selectedModel, enableTools });
+    onSend(content, { model: selectedModel });
     setContent("");
   }
 
@@ -49,10 +48,6 @@ export function Controls( {isDisabled = false, isStreaming = false, onSend, onCa
               <option value="claude-3-5-haiku-latest">Haiku</option>
               <option value="claude-3-opus-latest">Opus</option>
             </select>
-          </label>
-          <label className={styles.ToolsToggleLabel}>
-            <input type="checkbox" checked={enableTools} disabled={isDisabled} onChange={e=>setEnableTools(e.target.checked)} />
-            <span>Use tools</span>
           </label>
         </div>
         <div className={styles.TextAreaContainer}>
