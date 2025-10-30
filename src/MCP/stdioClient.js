@@ -105,13 +105,18 @@ export class StdioMcpClient {
   }
 }
 
-export async function waitForReady(client, { toolName = 'read_file', maxWaitMs = 5000 } = {}) {
+// Improved readiness helper: if requireTool=true, waits for a specific tool to appear.
+// Otherwise any successful tools/list (even empty array) indicates initialization succeeded.
+export async function waitForReady(client, { toolName = 'read_file', maxWaitMs = 5000, requireTool = true } = {}) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     try {
       const tools = await client.listTools({ forceRefresh: true });
-      if (tools.some(t => t.name === toolName)) return true;
-    } catch {}
+      if (!requireTool) return true; // any successful list means ready
+      if (Array.isArray(tools) && tools.some(t => t.name === toolName)) return true;
+    } catch {
+      // swallow and retry until timeout
+    }
     await new Promise(r => setTimeout(r, 300));
   }
   return false;

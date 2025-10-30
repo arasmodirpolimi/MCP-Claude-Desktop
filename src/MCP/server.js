@@ -125,7 +125,7 @@ async function spawnServersFromConfig({ replace = false } = {}) {
     return names;
   }
   for (const [key, def] of entries) {
-    let { command, args = [], type = "external", name = key } = def || {};
+    let { command, args = [], type = "external", name = key, cwd } = def || {};
     if (!command) { console.warn("[MCP] skip", key, "missing command"); continue; }
     // Consolidated duplicate detection: Treat any existing server whose name matches (or filesystem variants) as duplicate
     const existingVariant = [...sessionServers.values()].find(s => s.name === name || (
@@ -235,7 +235,8 @@ async function spawnServersFromConfig({ replace = false } = {}) {
         for (const v of variants) {
           if (proc) break;
           try {
-            proc = spawn(v.cmd, v.argv, { cwd: process.cwd(), stdio: ["pipe","pipe","pipe"] });
+            const spawnCwd = typeof cwd === 'string' && cwd.trim() ? cwd : process.cwd();
+            proc = spawn(v.cmd, v.argv, { cwd: spawnCwd, stdio: ["pipe","pipe","pipe"] });
             proc._spawnLabel = v.label;
             spawnAttempts.push({ label: v.label, command: v.cmd, args: v.argv, ok: true });
           } catch (e) {
@@ -278,8 +279,24 @@ async function spawnServersFromConfig({ replace = false } = {}) {
         let stdoutBuf = ""; let stderrBuf = ""; let started = false; const birth = Date.now();
         proc.stdout.setEncoding("utf8"); proc.stderr.setEncoding("utf8");
         proc.stdout.on("data", c => { const t = c.toString(); stdoutBuf += t; if (!started && stdoutBuf.length) started = true; });
-        proc.stderr.on("data", c => { const t = c.toString(); stderrBuf += t; if (/Error|ENOENT|EACCES|ECONNREFUSED/i.test(t)) console.warn("[auto-external-mcp][stderr]", t.trim()); });
-        proc.on("exit", code => { console.log("[auto-external-mcp] process exited", code, key); const life = Date.now()-birth; if (life < 2000 && !started) { const entry = sessionServers.get(id); if (entry) entry.warning = "Exited immediately; no tools."; }});
+        proc.stderr.on("data", c => { const t = c.toString(); stderrBuf += t; if (/Error|ENOENT|EACCES|ECONNREFUSED|SyntaxError|ReferenceError/i.test(t)) console.warn("[auto-external-mcp][stderr]", t.trim()); });
+        proc.on("exit", code => {
+          const life = Date.now()-birth;
+          const previewStdout = stdoutBuf.slice(-800);
+          const previewStderr = stderrBuf.slice(-800);
+          console.log("[auto-external-mcp] process exited", code, key, 'life(ms)=', life, 'cwd=', cwd || process.cwd());
+          if (code === 9) {
+            console.warn('[auto-external-mcp] exit code 9 (SIGKILL or forced termination). Stderr/stdout preview:', { stderr: previewStderr, stdout: previewStdout });
+          }
+          if (life < 2000 && !started) {
+            const entry = sessionServers.get(id);
+            if (entry) {
+              entry.warning = "Exited immediately; no tools.";
+              entry.stderr = previewStderr;
+              entry.stdout = previewStdout;
+            }
+          }
+        });
         proc.on('error', err => {
           console.error('[auto-external-mcp] spawn error', err);
           // Windows-specific ENOENT guidance for npm/npx issues
@@ -300,11 +317,12 @@ async function spawnServersFromConfig({ replace = false } = {}) {
         const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
         await server.connect(transport);
         let stdioClient = null; try { stdioClient = new StdioMcpClient(proc, { timeoutMs: 8000 }); } catch (e) { console.warn("[auto-external-mcp] failed StdioMcpClient", e); }
-        const serverEntry = { server, transport, name, type: isFilesystem ? 'filesystem' : 'external', proc, stdioClient, external: { command, args, attempts: spawnAttempts }, baseUrl: null, stdout: () => stdoutBuf.slice(-4000), stderr: () => stderrBuf.slice(-4000), toolCount: 0, spawnAttempts };
+  const serverEntry = { server, transport, name, type: isFilesystem ? 'filesystem' : 'external', proc, stdioClient, external: { command, args, cwd: typeof cwd === 'string' && cwd.trim() ? cwd : process.cwd(), attempts: spawnAttempts }, baseUrl: null, stdout: () => stdoutBuf.slice(-4000), stderr: () => stderrBuf.slice(-4000), toolCount: 0, spawnAttempts };
         sessionServers.set(id, serverEntry);
         (async () => {
           if (!stdioClient) return;
-          const ready = await waitForReady(stdioClient).catch(()=>false);
+          // For non-filesystem external servers, treat any successful initialize/list as readiness
+          const ready = await waitForReady(stdioClient, { toolName: 'read_file', requireTool: isFilesystem }).catch(()=>false);
           if (!ready) {
             console.warn("[auto-external-mcp] readiness probe timed out for", key);
             if (isFilesystem) {
@@ -1049,7 +1067,7 @@ app.post("/api/mcp/servers", async (req, res) => {
     // Attempt readiness probe (non-blocking)
     (async () => {
       if (!stdioClient) return;
-      const ready = await waitForReady(stdioClient).catch(() => false);
+      const ready = await waitForReady(stdioClient, { toolName: 'read_file', requireTool: type === 'filesystem' }).catch(() => false);
       if (!ready) {
         console.warn(
           "[filesystem-mcp] readiness probe timed out; tools may be unavailable yet"
@@ -1142,9 +1160,9 @@ app.post("/api/mcp/servers", async (req, res) => {
     });
     (async () => {
       if (!stdioClient) return;
-      const ready = await waitForReady(stdioClient).catch(() => false);
-      if (!ready) console.warn("[external-mcp] readiness probe timed out; tools may be unavailable yet");
-      else console.log("[external-mcp] external server reported tools list readiness");
+      const ready = await waitForReady(stdioClient, { toolName: 'read_file', requireTool: false }).catch(() => false);
+      if (!ready) console.warn("[external-mcp] readiness probe timed out (non-filesystem). Assuming initialize complete without 'read_file' tool.");
+      else console.log("[external-mcp] external server initialization acknowledged");
     })();
     // Bridge generic external server tools into internal registry (non-blocking)
     (async () => {

@@ -1,3 +1,25 @@
 {
-    "mcpServers": {}
+  "mcpServers": {
+    "filesystem": {
+      "command": "npm.cmd",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "."
+      ]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-fetch"
+      ]
+    },
+    "weather": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\Arsalan\\Desktop\\MCP\\MCP_weather_JS\\build\\index.js"
+      ],
+      "cwd": "C:\\Users\\Arsalan\\Desktop\\MCP\\MCP_weather_JS\\build"
+    }
+  }
 }
