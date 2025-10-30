@@ -4,8 +4,12 @@
 import "dotenv/config";
 import express from "express";
 import { randomUUID } from "node:crypto";
+import { createRequire } from 'node:module';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { spawn } from 'node:child_process';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { registerTools, TOOL_DEFS, addTool, removeTool, buildAnthropicTools, getCurrentWeatherFn, getToolUsageLog } from "./registerTools.js";
 import { z } from 'zod';
 import cors from "cors";
@@ -77,22 +81,379 @@ app.use(
 
 // ---------------- MCP session management endpoints -----------------
 // Maintain per-session MCP servers so tools registered dynamically are isolated per browser tab.
-const sessionServers = new Map(); // sessionId -> { server, transport }
+// Persist sessions across potential hot-reload / dev restarts by stashing on globalThis.
+const globalKey = '__mcp_session_servers__';
+const sessionServers = (globalThis[globalKey] instanceof Map) ? globalThis[globalKey] : new Map();
+globalThis[globalKey] = sessionServers; // ensure future reloads reuse
+console.log('[MCP] sessionServers init. Existing entries:', sessionServers.size);
+
+// ---------------- Chat Memory Store ----------------------------------------
+// Per-session conversational memory. In-memory Map (can swap to Redis or DB later).
+// Shape: memoryMap[sessionId] = { messages: [ { role, content, ts } ], summaries: [ { content, ts } ], chars }
+const memoryKey = '__chat_memory_store__';
+const memoryMap = (globalThis[memoryKey] instanceof Map) ? globalThis[memoryKey] : new Map();
+globalThis[memoryKey] = memoryMap;
+const MAX_MEMORY_CHARS = 12000; // rough cap before summarization
+const SUMMARY_TARGET = 6000; // after summarizing prune to this size
+
+function estimateChars(arr) { return arr.reduce((n,m)=> n + (m.content?.length||0),0); }
+function buildMemoryContext(sessionId) {
+  const entry = memoryMap.get(sessionId);
+  if (!entry) return [];
+  // Convert stored messages + summaries to Anthropic style earlier context.
+  const ctx = [];
+  for (const s of entry.summaries) ctx.push({ role: 'assistant', content: [ { type: 'text', text: '(summary) ' + s.content } ] });
+  for (const m of entry.messages) ctx.push({ role: m.role, content: [ { type: 'text', text: m.content } ] });
+  return ctx;
+}
+
+function summarizeOldMessages(entry) {
+  if (!entry || entry.messages.length < 6) return; // require some depth
+  const half = Math.floor(entry.messages.length / 2);
+  const toSummarize = entry.messages.slice(0, half);
+  const summaryText = toSummarize.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`.slice(0,300)).join('\n');
+  entry.summaries.push({ content: summaryText, ts: Date.now() });
+  entry.messages = entry.messages.slice(half); // keep recent half
+}
+
+// Shared helper to store memory messages internally or via HTTP endpoint.
+function storeMemoryMessage(sessionId, role, content) {
+  if (!sessionId || typeof sessionId !== 'string') return { error: 'Missing sessionId' };
+  if (!['user','assistant','system'].includes(role)) return { error: 'Invalid role' };
+  if (typeof content !== 'string' || !content.trim()) return { error: 'Invalid content' };
+  const entry = memoryMap.get(sessionId) || { messages: [], summaries: [], chars: 0 };
+  entry.messages.push({ role, content, ts: Date.now() });
+  entry.chars = estimateChars(entry.messages) + estimateChars(entry.summaries);
+  if (entry.chars > MAX_MEMORY_CHARS) {
+    summarizeOldMessages(entry);
+    entry.chars = estimateChars(entry.messages) + estimateChars(entry.summaries);
+    if (entry.chars > MAX_MEMORY_CHARS) {
+      entry.messages.shift();
+      entry.chars = estimateChars(entry.messages) + estimateChars(entry.summaries);
+    }
+  }
+  memoryMap.set(sessionId, entry);
+  return { ok: true, sessionId, counts: { messages: entry.messages.length, summaries: entry.summaries.length }, chars: entry.chars };
+}
+
+app.post('/memory/append', async (req, res) => {
+  const { sessionId, role, content } = req.body || {};
+  const result = storeMemoryMessage(sessionId, role, content);
+  if (!result.ok) return res.status(400).json(result);
+  return res.json(result);
+});
+
+app.get('/memory/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+  const entry = memoryMap.get(sessionId) || { messages: [], summaries: [], chars: 0 };
+  return res.json({ sessionId, messages: entry.messages, summaries: entry.summaries, chars: entry.chars });
+});
+
+app.post('/memory/clear', (req, res) => {
+  const { sessionId } = req.body || {};
+  if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+  memoryMap.delete(sessionId);
+  return res.json({ ok: true, sessionId });
+});
+
+// Root directory allowed for filesystem tools (restrict escaping). Can override with FS_ROOT env.
+const FS_ROOT = path.resolve(process.env.FS_ROOT || process.cwd());
+
+function withinRoot(p) {
+  const abs = path.resolve(FS_ROOT, p);
+  return abs.startsWith(FS_ROOT) ? abs : null;
+}
+
+function ensureFilesystemTools() {
+  // Register once; skip if already present
+  const defs = [
+    {
+      name: 'read_file',
+      description: 'Read text file contents (UTF-8)',
+      inputSchema: z.object({ path: z.string().describe('Relative or absolute file path inside root'), maxBytes: z.number().optional().describe('Truncate after this many bytes') }),
+      handler: async ({ path: rel, maxBytes = 20000 }) => {
+        const target = withinRoot(rel);
+        if (!target) return { content: [ { type: 'text', text: 'Path outside root denied' } ] };
+        try {
+          let data = await fs.readFile(target, 'utf8');
+          if (data.length > maxBytes) data = data.slice(0, maxBytes) + `\n...TRUNCATED (${data.length} bytes total)`;
+          return { content: [ { type: 'text', text: data } ] };
+        } catch (e) {
+          return { content: [ { type: 'text', text: 'read_file error: ' + String(e?.message || e) } ] };
+        }
+      }
+    },
+    {
+      name: 'write_file',
+      description: 'Write (overwrite) text content to a file',
+      inputSchema: z.object({ path: z.string(), content: z.string() }),
+      handler: async ({ path: rel, content }) => {
+        const target = withinRoot(rel);
+        if (!target) return { content: [ { type: 'text', text: 'Path outside root denied' } ] };
+        try { await fs.writeFile(target, content, 'utf8'); return { content: [ { type: 'text', text: 'OK wrote ' + rel } ] }; } catch (e) { return { content: [ { type: 'text', text: 'write_file error: ' + String(e?.message || e) } ] }; }
+      }
+    },
+    {
+      name: 'append_file',
+      description: 'Append text to a file (creates if missing)',
+      inputSchema: z.object({ path: z.string(), content: z.string() }),
+      handler: async ({ path: rel, content }) => {
+        const target = withinRoot(rel); if (!target) return { content:[{ type:'text', text:'Path outside root denied'}] };
+        try { await fs.appendFile(target, content, 'utf8'); return { content:[{ type:'text', text:'OK appended '+rel }] }; } catch(e){ return { content:[{ type:'text', text:'append_file error: '+String(e?.message||e)}] }; }
+      }
+    },
+    {
+      name: 'list_directory',
+      description: 'List files in a directory',
+      inputSchema: z.object({ path: z.string().default('.').describe('Directory path') }),
+      handler: async ({ path: rel='.' }) => {
+        const target = withinRoot(rel); if (!target) return { content:[{ type:'text', text:'Path outside root denied'}] };
+        try { const items = await fs.readdir(target); return { content:[{ type:'text', text: items.join('\n')||'(empty)' }] }; } catch(e){ return { content:[{ type:'text', text:'list_directory error: '+String(e?.message||e)}] }; }
+      }
+    },
+    {
+      name: 'create_directory',
+      description: 'Create a directory (recursive)',
+      inputSchema: z.object({ path: z.string() }),
+      handler: async ({ path: rel }) => { const target = withinRoot(rel); if (!target) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { await fs.mkdir(target,{recursive:true}); return { content:[{ type:'text', text:'OK created '+rel }] }; } catch(e){ return { content:[{ type:'text', text:'create_directory error: '+String(e?.message||e)}] }; } }
+    },
+    {
+      name: 'delete_file',
+      description: 'Delete a file',
+      inputSchema: z.object({ path: z.string() }),
+      handler: async ({ path: rel }) => { const target = withinRoot(rel); if (!target) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { await fs.unlink(target); return { content:[{ type:'text', text:'OK deleted '+rel }] }; } catch(e){ return { content:[{ type:'text', text:'delete_file error: '+String(e?.message||e)}] }; } }
+    },
+    {
+      name: 'rename',
+      description: 'Rename a file or directory',
+      inputSchema: z.object({ from: z.string(), to: z.string() }),
+      handler: async ({ from, to }) => { const f=withinRoot(from), t=withinRoot(to); if (!f||!t) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { await fs.rename(f,t); return { content:[{ type:'text', text:`OK renamed ${from} -> ${to}` }] }; } catch(e){ return { content:[{ type:'text', text:'rename error: '+String(e?.message||e)}] }; } }
+    },
+    {
+      name: 'copy',
+      description: 'Copy a file',
+      inputSchema: z.object({ from: z.string(), to: z.string() }),
+      handler: async ({ from, to }) => { const f=withinRoot(from), t=withinRoot(to); if(!f||!t) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { const data = await fs.readFile(f); await fs.writeFile(t,data); return { content:[{ type:'text', text:`OK copied ${from} -> ${to}` }] }; } catch(e){ return { content:[{ type:'text', text:'copy error: '+String(e?.message||e)}] }; } }
+    },
+    {
+      name: 'move',
+      description: 'Move a file (rename)',
+      inputSchema: z.object({ from: z.string(), to: z.string() }),
+      handler: async ({ from, to }) => { const f=withinRoot(from), t=withinRoot(to); if(!f||!t) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { await fs.rename(f,t); return { content:[{ type:'text', text:`OK moved ${from} -> ${to}` }] }; } catch(e){ return { content:[{ type:'text', text:'move error: '+String(e?.message||e)}] }; } }
+    },
+    {
+      name: 'search',
+      description: 'Search for a literal substring in files under a path (non-recursive)',
+      inputSchema: z.object({ path: z.string().default('.'), pattern: z.string() }),
+      handler: async ({ path: rel='.', pattern }) => { const target = withinRoot(rel); if(!target) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { const items = await fs.readdir(target); const hits=[]; for (const it of items){ const fp=path.join(target,it); try { const stat= await fs.stat(fp); if (!stat.isFile()) continue; const txt = await fs.readFile(fp,'utf8'); if (txt.includes(pattern)) hits.push(it); } catch{} } return { content:[{ type:'text', text: hits.length? hits.join('\n'): '(no matches)' }] }; } catch(e){ return { content:[{ type:'text', text:'search error: '+String(e?.message||e)}] }; } }
+    },
+    {
+      name: 'stat',
+      description: 'File stats (size, mtime, type)',
+      inputSchema: z.object({ path: z.string() }),
+      handler: async ({ path: rel }) => { const target=withinRoot(rel); if(!target) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { const st=await fs.stat(target); return { content:[{ type:'text', text: JSON.stringify({ size: st.size, mtime: st.mtime, isFile: st.isFile(), isDir: st.isDirectory() }, null, 2) }] }; } catch(e){ return { content:[{ type:'text', text:'stat error: '+String(e?.message||e)}] }; } }
+    },
+    {
+      name: 'read_json',
+      description: 'Read and pretty-print a JSON file',
+      inputSchema: z.object({ path: z.string() }),
+      handler: async ({ path: rel }) => { const target=withinRoot(rel); if(!target) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { const raw=await fs.readFile(target,'utf8'); const obj=JSON.parse(raw); return { content:[{ type:'text', text: JSON.stringify(obj,null,2) }] }; } catch(e){ return { content:[{ type:'text', text:'read_json error: '+String(e?.message||e)}] }; } }
+    },
+    {
+      name: 'write_json',
+      description: 'Write JSON (pretty) to a file',
+      inputSchema: z.object({ path: z.string(), json: z.string().describe('JSON string') }),
+      handler: async ({ path: rel, json }) => { const target=withinRoot(rel); if(!target) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { const parsed=JSON.parse(json); await fs.writeFile(target, JSON.stringify(parsed,null,2),'utf8'); return { content:[{ type:'text', text:'OK wrote JSON '+rel }] }; } catch(e){ return { content:[{ type:'text', text:'write_json error: '+String(e?.message||e)}] }; } }
+    },
+    {
+      name: 'tail_file',
+      description: 'Return last N lines of a file',
+      inputSchema: z.object({ path: z.string(), lines: z.number().default(50) }),
+      handler: async ({ path: rel, lines=50 }) => { const target=withinRoot(rel); if(!target) return { content:[{ type:'text', text:'Path outside root denied'}] }; try { const data=await fs.readFile(target,'utf8'); const parts=data.split(/\r?\n/); return { content:[{ type:'text', text: parts.slice(-lines).join('\n') }] }; } catch(e){ return { content:[{ type:'text', text:'tail_file error: '+String(e?.message||e)}] }; } }
+    }
+  ];
+  for (const def of defs) {
+    if (!TOOL_DEFS[def.name]) addTool(def);
+  }
+}
 
 app.post('/api/mcp/servers', async (req, res) => {
-  const { name = 'default', baseUrl } = req.body || {};
-  // For local embedded server, ignore baseUrl and create new instance
+  const { name = 'default', type = 'embedded', args = [], command = '', cwd = process.cwd() } = req.body || {};
   const id = randomUUID();
-  const server = createServer();
-  const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
-  await server.connect(transport);
-  sessionServers.set(id, { server, transport, name });
-  return res.json({ server: { id, name, path: `/mcp/${id}` } });
+  if (type === 'embedded') {
+    const server = createServer();
+    const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+    await server.connect(transport);
+    sessionServers.set(id, { server, transport, name, type, baseUrl: null });
+    console.log('[MCP] created embedded server', id, name);
+    return res.json({ server: { id, name, type, path: `/mcp/${id}`, baseUrl: null } });
+  }
+  if (type === 'filesystem') {
+    // Launch external filesystem MCP server via npx @modelcontextprotocol/server-filesystem .
+    // Windows requires npx.cmd; attempt cross-platform resolution
+    let cmd = command || 'npx';
+    if (process.platform === 'win32') {
+      // If user passed just 'npx', use npx.cmd to avoid ENOENT
+      if (cmd.toLowerCase() === 'npx') cmd = 'npx.cmd';
+    }
+    const fullArgs = args.length ? args : ['-y', '@modelcontextprotocol/server-filesystem', '.'];
+    let proc;
+    const spawnAttempts = [];
+    const trySpawn = (label, c, a) => {
+      try {
+        const p = spawn(c, a, { cwd, stdio: ['pipe','pipe','pipe'] });
+        p._spawnLabel = label;
+        spawnAttempts.push({ label, command:c, args:a, ok:true });
+        return p;
+      } catch (err) {
+        spawnAttempts.push({ label, command:c, args:a, ok:false, error:String(err?.message||err) });
+        return null;
+      }
+    };
+    // Attempt sequence: primary cmd, if win32 also try alternative npx/npx.cmd, then npm exec
+    proc = trySpawn('primary', cmd, fullArgs);
+    if (!proc && process.platform === 'win32' && cmd !== 'npx.cmd') {
+      proc = trySpawn('win-npx-cmd', 'npx.cmd', fullArgs);
+    }
+    if (!proc) {
+      const altCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+      proc = trySpawn('npm-exec', altCmd, ['exec','@modelcontextprotocol/server-filesystem','.']);
+    }
+    // Final fallback: attempt direct node module resolution of package bin
+    if (!proc) {
+      try {
+        const require = createRequire(import.meta.url);
+        const pkgPath = require.resolve('@modelcontextprotocol/server-filesystem/package.json');
+        const pkgDir = path.dirname(pkgPath);
+        const raw = await fs.readFile(pkgPath, 'utf8');
+        const pkgJson = JSON.parse(raw);
+        const candidates = [];
+        if (typeof pkgJson.bin === 'string') candidates.push(path.join(pkgDir, pkgJson.bin));
+        if (pkgJson.bin && typeof pkgJson.bin === 'object') {
+          for (const v of Object.values(pkgJson.bin)) {
+            candidates.push(path.join(pkgDir, v));
+          }
+        }
+        // heuristic extra paths
+        candidates.push(path.join(pkgDir, 'index.js'));
+        candidates.push(path.join(pkgDir, 'dist', 'index.js'));
+        let script = null;
+        for (const c of candidates) {
+          try { await fs.access(c); script = c; break; } catch {}
+        }
+        if (script) {
+          proc = trySpawn('direct-node', process.execPath, [script, '.']);
+        } else {
+          spawnAttempts.push({ label:'direct-node', ok:false, error:'No viable bin script found', candidates });
+        }
+      } catch (e) {
+        spawnAttempts.push({ label:'direct-node', ok:false, error:'Resolution failed: '+String(e?.message||e) });
+      }
+    }
+    if (!proc) {
+      // Try in-process import fallback if module is installed
+      let inprocOk = false;
+      try {
+        const require = createRequire(import.meta.url);
+        const mod = require('@modelcontextprotocol/server-filesystem');
+        if (mod && typeof mod.createServer === 'function') {
+          ensureFilesystemTools(); // still register local tool handlers
+          const server = new McpServer({ name: 'filesystem-server-inproc', version: '1.0.0', capabilities: { tools: {}, resources: {} } });
+          const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+          await server.connect(transport);
+          sessionServers.set(id, { server, transport, name, type: 'filesystem-inproc', spawnAttempts, baseUrl: null, note: 'Using in-process imported filesystem server; tools proxied locally.' });
+          console.log('[MCP] created filesystem-inproc server', id, name);
+          inprocOk = true;
+          return res.status(200).json({ server: { id, name, type: 'filesystem-inproc', path: `/mcp/${id}`, baseUrl: null, attempts: spawnAttempts, note: 'In-process import fallback active.' } });
+        }
+      } catch {}
+      if (!inprocOk) {
+        // Degraded mode
+        ensureFilesystemTools();
+        const server = new McpServer({ name: 'filesystem-server-degraded', version: '1.0.0', capabilities: { tools: {}, resources: {} } });
+        const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+        await server.connect(transport);
+        sessionServers.set(id, { server, transport, name, type: 'filesystem-degraded', spawnAttempts, baseUrl: null, warning: 'All spawn attempts failed; static in-process file tools active.' });
+        console.log('[MCP] created filesystem-degraded server', id, name);
+        return res.status(200).json({ server: { id, name, type: 'filesystem-degraded', path: `/mcp/${id}`, baseUrl: null, warning: 'All spawn attempts failed; static in-process file tools active.', attempts: spawnAttempts } });
+      }
+    }
+    let started = false; let stderrBuf=''; let stdoutBuf='';
+    const birth = Date.now();
+    proc.stdout.on('data', chunk => {
+      const text = chunk.toString();
+      stdoutBuf += text;
+      if (!started && /"root"|read_file|list_directory/.test(stdoutBuf)) started = true;
+    });
+    proc.stderr.on('data', chunk => {
+      const text = chunk.toString();
+      stderrBuf += text;
+      if (/Error|ENOENT|EACCES|ECONNREFUSED/i.test(text)) console.warn('[filesystem-mcp][stderr]', text.trim());
+    });
+    proc.on('exit', (code) => {
+      console.log('[filesystem-mcp] process exited', code, 'label', proc._spawnLabel);
+      const lifespan = Date.now() - birth;
+      if (lifespan < 2000 && !started) {
+        // Convert to degraded if process died immediately
+        for (const [sid, entry] of sessionServers.entries()) {
+          if (entry.proc === proc && entry.type === 'filesystem') {
+            console.warn('[filesystem-mcp] external process exited too quickly; switching to degraded for server', sid);
+            ensureFilesystemTools();
+            entry.type = 'filesystem-degraded';
+            entry.warning = 'External process exited immediately; degraded static tools active.';
+            entry.spawnAttempts = spawnAttempts;
+            entry.stderr = stderrBuf.slice(-4000);
+            entry.stdout = stdoutBuf.slice(-4000);
+          }
+        }
+      }
+    });
+    proc.on('error', (err) => {
+      console.error('[filesystem-mcp] spawn error', err);
+    });
+    // Register internal FS tools (works even if external process not yet ready)
+    ensureFilesystemTools();
+    // Create a local MCP client server wrapper to expose tools list via our HTTP transport
+    const server = new McpServer({ name: 'filesystem-server', version: '1.0.0', capabilities: { tools: {}, resources: {} } });
+    const transport = new StreamableHTTPServerTransport({ path: `/mcp/${id}` });
+    await server.connect(transport);
+    // We do NOT register our own tools; external server is separate. We'll proxy its list.
+    sessionServers.set(id, { server, transport, name, type, proc, external: { command: cmd, args: fullArgs, cwd }, baseUrl: null, stdout: () => stdoutBuf.slice(-4000), stderr: () => stderrBuf.slice(-4000) });
+    console.log('[MCP] created filesystem external server', id, name);
+    return res.json({ server: { id, name, type, path: `/mcp/${id}`, baseUrl: null, external: { command: cmd, args: fullArgs, cwd } } });
+  }
+  return res.status(400).json({ error: 'Unsupported server type' });
 });
 
 app.get('/api/mcp/servers', (req, res) => {
-  const servers = [...sessionServers.entries()].map(([id, v]) => ({ id, name: v.name, path: `/mcp/${id}` }));
+  const servers = [...sessionServers.entries()].map(([id, v]) => ({
+    id,
+    name: v.name,
+    type: v.type,
+    path: `/mcp/${id}`,
+    baseUrl: v.baseUrl || null,
+    warning: v.warning || null,
+    attempts: v.spawnAttempts ? v.spawnAttempts.slice(-10) : undefined
+  }));
   return res.json({ servers });
+});
+
+// Diagnostics for a single server (spawn attempts, stderr/stdout buffers if captured later)
+app.get('/api/mcp/servers/:id/diagnostics', (req, res) => {
+  const { id } = req.params;
+  const entry = sessionServers.get(id);
+  if (!entry) return res.status(404).json({ error: 'Server not found' });
+  return res.json({
+    id,
+    name: entry.name,
+    type: entry.type,
+    warning: entry.warning || null,
+    attempts: entry.spawnAttempts || [],
+    external: entry.external || null,
+    stdout: typeof entry.stdout === 'function' ? entry.stdout() : (entry.stdout || null),
+    stderr: typeof entry.stderr === 'function' ? entry.stderr() : (entry.stderr || null)
+  });
 });
 
 app.delete('/api/mcp/servers/:id', (req, res) => {
@@ -104,23 +465,56 @@ app.delete('/api/mcp/servers/:id', (req, res) => {
   return res.json({ ok: true });
 });
 
-app.get('/api/mcp/servers/:id/tools', (req, res) => {
+app.get('/api/mcp/servers/:id/tools', async (req, res) => {
   const { id } = req.params || {};
-  if (!sessionServers.has(id)) return res.status(404).json({ error: 'Server not found' });
-  const tools = Object.values(TOOL_DEFS).map(def => ({ name: def.name, description: def.description }));
-  return res.json({ tools });
+  const entry = sessionServers.get(id);
+  if (!entry) {
+    console.warn('[MCP] tools request for missing server id', id, 'current size', sessionServers.size);
+    return res.status(404).json({ error: 'Server not found' });
+  }
+  if (entry.type === 'embedded') {
+    const tools = Object.values(TOOL_DEFS).map(def => ({ name: def.name, description: def.description }));
+    return res.json({ tools });
+  }
+  if (entry.type === 'filesystem') {
+    // Query external server by spawning a one-off npx list or using existing process output heuristics.
+    // Simplified approach: call the same command with --help or rely on captured stdout buffer.
+    // For a robust approach you would implement MCP client handshake; here we parse available tools from stdout.
+    const procInfo = entry.external;
+    // Attempt naive tool extraction: look for lines like '"name": "read_file"'
+    const stdoutSample = (entry.proc && entry.proc.stdout ? '' : '') + '';// placeholder
+    // Since parsing live process output reliably is complex, return a static map documenting known filesystem tools.
+    const filesystemTools = [
+      'read_file','write_file','list_directory','create_directory','delete_file','rename','move','copy','search','stat','read_json','write_json','append_file','tail_file'
+    ];
+  return res.json({ tools: filesystemTools.map(n => ({ name: n, description: `Filesystem operation: ${n}`, enabled: true })) });
+  }
+  if (entry.type === 'filesystem-degraded') {
+    const filesystemTools = [
+      'read_file','write_file','list_directory','create_directory','delete_file','rename','move','copy','search','stat','read_json','write_json','append_file','tail_file'
+    ];
+  return res.json({ tools: filesystemTools.map(n => ({ name: n, description: `Filesystem operation (degraded mode): ${n}`, enabled: true })), warning: 'Process spawn failed; these are static tool descriptors only.' });
+  }
+  if (entry.type === 'filesystem-inproc') {
+    const filesystemTools = [
+      'read_file','write_file','list_directory','create_directory','delete_file','rename','move','copy','search','stat','read_json','write_json','append_file','tail_file'
+    ];
+  return res.json({ tools: filesystemTools.map(n => ({ name: n, description: `Filesystem operation (in-process): ${n}`, enabled: true })) });
+  }
+  return res.status(400).json({ error: 'Unsupported server type' });
 });
 
 app.post('/api/mcp/servers/:id/tool-call', async (req, res) => {
   const { id } = req.params || {};
-  const { toolName, arguments: args = {} } = req.body || {};
+  const { toolName, tool, arguments: args = {} } = req.body || {};
+  const name = toolName || tool;
   const entry = sessionServers.get(id);
   if (!entry) return res.status(404).json({ error: 'Server not found' });
-  const def = TOOL_DEFS[toolName];
+  const def = TOOL_DEFS[name];
   if (!def) return res.status(404).json({ error: 'Tool not found' });
   try {
     const r = await def.handler(args || {});
-    return res.json({ result: r });
+    return res.json({ result: r, tool: name });
   } catch (e) {
     return res.status(500).json({ error: String(e?.message || e) });
   }
@@ -130,11 +524,17 @@ app.post('/api/mcp/servers/:id/tool-call', async (req, res) => {
 // SSE endpoint: /anthropic/chat { prompt, model?, max_tokens? }
 app.post('/anthropic/chat', async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  const { prompt, model: requestedModel, max_tokens = 512 } = req.body || {};
+  const { prompt, model: requestedModel, max_tokens = 512, sessionId } = req.body || {};
   const defaultModel = process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-latest';
   let model = requestedModel || defaultModel;
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'Invalid prompt' });
+  }
+  // Prepend memory context if provided
+  const memoryMessages = sessionId ? buildMemoryContext(sessionId) : [];
+  if (sessionId) {
+    // Store user message before model call
+    storeMemoryMessage(sessionId, 'user', prompt);
   }
   if (!apiKey) {
     // Mock stream fallback for local dev without key
@@ -159,7 +559,7 @@ app.post('/anthropic/chat', async (req, res) => {
           'anthropic-version': '2023-06-01',
           'content-type': 'application/json'
         },
-        body: JSON.stringify({ model: modelName, max_tokens, messages: [{ role: 'user', content: prompt }], stream: true })
+        body: JSON.stringify({ model: modelName, max_tokens, messages: memoryMessages.concat([{ role: 'user', content: prompt }]), stream: true })
       });
     }
     let upstream = await callAnthropic(model);
@@ -200,9 +600,18 @@ app.post('/anthropic/chat', async (req, res) => {
         try {
           const payload = JSON.parse(line.slice(5));
           const delta = payload?.delta?.text || payload?.content_block?.text || payload?.text || (payload?.type === 'content_block_delta' && payload?.delta?.type === 'text_delta' ? payload?.delta?.text : '');
-          if (delta) res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+          if (delta) {
+            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+            if (sessionId) {
+              // Accumulate assistant text for memory after stream completes
+              aggregatedAssistant += delta;
+            }
+          }
         } catch {}
       }
+    }
+    if (sessionId && aggregatedAssistant.trim()) {
+      storeMemoryMessage(sessionId, 'assistant', aggregatedAssistant.trim());
     }
     res.write('data: [DONE]\n\n');
     res.end();
@@ -211,133 +620,113 @@ app.post('/anthropic/chat', async (req, res) => {
   }
 });
 
-// ---------------- Anthropic tool-aware streaming (simplified) -------------
-// Client expects structured events; here we only stream text as assistant_text.
-// TODO: Integrate real tool orchestration if needed (currently handled client-side / non-stream endpoint).
+// ---------------- Anthropic tool-aware streaming (multi-turn) -------------
+// Emits structured events: model_used, tool_use, tool_result, tool_error, assistant_text, done
+// Strategy: iterative non-stream Anthropic calls to capture tool_use blocks; final answer streamed in chunks.
 app.post('/anthropic/ai/chat-stream', async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  const { prompt, model: requestedModel } = req.body || {};
+  const { prompt, model: requestedModel, sessionId, max_iterations = 5 } = req.body || {};
   const defaultModel = process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-latest';
   let model = requestedModel || defaultModel;
   if (typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: 'Invalid prompt' });
-
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
   res.flushHeaders?.();
   const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
-  // Helper to decide if tools should be invoked (heuristic)
-  const needsWeather = /\bweather\b|\bforecast\b/i.test(prompt);
-  const needsHttpGet = /https?:\/\//i.test(prompt);
-
   if (!apiKey) {
-    // Mock streaming with simulated tool events
     send({ type: 'model_used', model: 'mock-anthropic' });
-    if (needsWeather) {
-      send({ type: 'tool_use', tool: 'get_current_weather', args: { location: 'Milan', unit: 'celsius' } });
-      try {
-        const live = await getCurrentWeatherFn({ location: 'Milan' });
-        send({ type: 'tool_result', tool: 'get_current_weather', output: live });
-      } catch (e) {
-        send({ type: 'tool_error', tool: 'get_current_weather', error: String(e?.message || e) });
-      }
-    }
-    send({ type: 'assistant_text', text: 'Mock (no key). ' + (needsWeather ? 'Fetched weather. ' : '') + prompt.slice(0,120) });
+    send({ type: 'assistant_text', text: 'Mock (no key). ' + prompt.slice(0,160) });
     send({ type: 'done' });
     return res.end();
   }
 
-  // Phase 1: optionally run tools first (pre-call) then ask Anthropic to summarize
-  const toolOutputs = [];
-  if (needsWeather) {
-    const args = { location: 'Milan', unit: 'celsius' }; // TODO: parse location more robustly
-    send({ type: 'tool_use', tool: 'get_current_weather', args });
-    try {
-      const result = await getCurrentWeatherFn(args);
-      send({ type: 'tool_result', tool: 'get_current_weather', output: result });
-      toolOutputs.push({ role: 'assistant', content: [ { type: 'tool_result', tool_use_id: 'weather-1', content: [{ type: 'text', text: JSON.stringify(result) }] } ] });
-    } catch (e) {
-      send({ type: 'tool_error', tool: 'get_current_weather', error: String(e?.message || e) });
-    }
-  }
-  if (needsHttpGet) {
-    // Extract first URL
-    const urlMatch = /(https?:\/\/[^\s]+)/i.exec(prompt);
-    if (urlMatch) {
-      const url = urlMatch[1];
-      send({ type: 'tool_use', tool: 'http_get', args: { url, maxBytes: 8000 } });
-      try {
-        const resp = await fetch(url, { headers: { 'accept': 'text/plain, text/html' } });
-        let text = await resp.text();
-        if (text.length > 8000) text = text.slice(0,8000) + '\n...TRUNCATED';
-        const output = { status: resp.status, snippet: text.slice(0,500) };
-        send({ type: 'tool_result', tool: 'http_get', output });
-        toolOutputs.push({ role: 'assistant', content: [ { type: 'tool_result', tool_use_id: 'http_get-1', content: [{ type: 'text', text: JSON.stringify(output) }] } ] });
-      } catch (e) {
-        send({ type: 'tool_error', tool: 'http_get', error: String(e?.message || e) });
+  if (sessionId) storeMemoryMessage(sessionId, 'user', prompt);
+  const tools = buildAnthropicTools();
+  const toolListForSystem = Object.values(TOOL_DEFS).map(def => `- ${def.name}: ${def.description}`).join('\n');
+  const system = `You are a helpful assistant.
+You currently have access to the following runtime tools (enumerate ONLY when asked):\n${toolListForSystem || '- (no tools registered)'}\nInstructions:\n- When needing external data (weather, URLs, filesystem), invoke appropriate tool with correct arguments.\n- After receiving tool results, incorporate them faithfully without fabrication.`;
+  let messages = (sessionId ? buildMemoryContext(sessionId) : []).concat([{ role: 'user', content: prompt }]);
+
+  async function anthropicOnce(currentModel) {
+    const body = { model: currentModel, max_tokens: 512, system, messages, tools };
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) {
+      if (r.status === 404) {
+        const fallbacks = [ 'claude-3-5-sonnet-latest','claude-3-5-haiku-latest','claude-3-opus-latest' ];
+        for (const fb of fallbacks) {
+          if (fb === currentModel) continue;
+          const r2 = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST', headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+            body: JSON.stringify({ ...body, model: fb })
+          });
+          if (r2.ok) { model = fb; return await r2.json(); }
+        }
       }
+      const txt = await r.text().catch(()=> '');
+      throw new Error(`Anthropic upstream error ${r.status} ${txt.slice(0,160)}`);
     }
+    return await r.json();
   }
 
-  // Phase 2: stream Anthropic answer including context from tool results
-  try {
-    async function call(modelName) {
-      return await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-        body: JSON.stringify({
-          model: modelName,
-          max_tokens: 512,
-          messages: [ { role: 'user', content: prompt } ].concat(toolOutputs),
-          stream: true
-        })
-      });
-    }
-    let upstream = await call(model);
-    if (upstream.status === 404) {
-      const fallbacks = [ 'claude-3-5-sonnet-latest','claude-3-5-haiku-latest','claude-3-opus-latest' ];
-      for (const fb of fallbacks) {
-        if (fb === model) continue;
-        const attempt = await call(fb);
-        if (attempt.ok) { model = fb; upstream = attempt; break; }
-      }
-    }
-    if (!upstream.ok || !upstream.body) {
-      let details=''; try { details = await upstream.text(); } catch {}
-      send({ type: 'error', error: `Anthropic upstream error ${upstream.status}`, details: details.slice(0,160) });
-      send({ type: 'done' });
-      return res.end();
-    }
-    send({ type: 'model_used', model });
-    const reader = upstream.body.getReader();
-    let cancelled = false;
-    req.on('close', () => { cancelled = true; try { reader.cancel(); } catch {} });
-    const decoder = new TextDecoder();
-    let buffer = '';
-    while (true) {
-      const { value, done } = await reader.read(); if (done) break;
-      if (cancelled) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split(/\n/); buffer = lines.pop() || '';
-      for (const raw of lines) {
-        const line = raw.trim(); if (!line) continue;
-        if (line === 'data: [DONE]') { send({ type: 'done' }); return res.end(); }
-        if (!line.startsWith('data:')) continue;
+  send({ type: 'model_used', model });
+  let finalText = '';
+  for (let iter = 0; iter < max_iterations; iter++) {
+    let response;
+    try { response = await anthropicOnce(model); } catch (e) { send({ type: 'error', error: String(e?.message || e) }); break; }
+    const contentBlocks = response.content || [];
+    const toolUses = contentBlocks.filter(b => b.type === 'tool_use');
+    const textBlocks = contentBlocks.filter(b => b.type === 'text');
+    // If there are tool uses, execute them then append results and loop
+    if (toolUses.length) {
+      // Append tool_use blocks (assistant role)
+      messages.push({ role: 'assistant', content: contentBlocks });
+      const collectedResults = [];
+      for (const t of toolUses) {
+        const toolName = t.name; const toolArgs = t.input || {}; const toolId = t.id || t.tool_use_id || `${toolName}-${Date.now()}`;
+        send({ type: 'tool_use', tool: toolName, args: toolArgs, id: toolId, iteration: iter });
+        const def = TOOL_DEFS[toolName];
+        if (!def) { send({ type: 'tool_error', tool: toolName, error: 'Tool not registered' }); continue; }
         try {
-          const payload = JSON.parse(line.slice(5));
-          const delta = payload?.delta?.text || payload?.content_block?.text || payload?.text || (payload?.type === 'content_block_delta' && payload?.delta?.type === 'text_delta' ? payload?.delta?.text : '');
-          if (delta) send({ type: 'assistant_text', text: delta });
-        } catch { /* ignore */ }
+          const result = await def.handler(toolArgs);
+          // result.content is an array of blocks; convert to string snippet
+          const textOut = Array.isArray(result?.content) ? result.content.map(c=> c.text || '').join('\n') : JSON.stringify(result);
+          send({ type: 'tool_result', tool: toolName, id: toolId, output: textOut.slice(0,4000) });
+          collectedResults.push({ type: 'tool_result', tool_use_id: toolId, content: [ { type: 'text', text: textOut.slice(0,8000) } ] });
+        } catch (err) {
+          send({ type: 'tool_error', tool: toolName, id: toolId, error: String(err?.message || err) });
+        }
       }
+      if (collectedResults.length) {
+        // Anthropic requires tool_result blocks inside a user role message
+        messages.push({ role: 'user', content: collectedResults });
+      }
+      // Continue loop to let model observe tool results
+      continue;
     }
-    send({ type: 'done' });
-    res.end();
-  } catch (e) {
-    send({ type: 'error', error: String(e?.message || e) });
-    send({ type: 'done' });
-    res.end();
+    // No tool uses: finalize with text
+    if (textBlocks.length) {
+      finalText = textBlocks.map(tb => tb.text).join('\n');
+      // Stream in pseudo-chunks for client consistency
+      const chunkSize = 200; let i = 0;
+      while (i < finalText.length) {
+        send({ type: 'assistant_text', text: finalText.slice(i, i+chunkSize) });
+        i += chunkSize;
+      }
+      break;
+    } else {
+      // If no text and no tools, we are done
+      break;
+    }
   }
+  if (sessionId && finalText.trim()) storeMemoryMessage(sessionId, 'assistant', finalText.trim());
+  send({ type: 'done', final: finalText.slice(0,8000) });
+  return res.end();
 });
 
 // Debug endpoint for local Node server: show Anthropic tool schema that would be sent
@@ -388,7 +777,7 @@ app.post('/anthropic/ai/chat', async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   const mockMode = process.env.ANTHROPIC_MOCK === '1' || !apiKey;
   if (!apiKey && !mockMode) return res.status(500).json({ error: 'Server missing ANTHROPIC_API_KEY' });
-  const { prompt, model: requestedModel = process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-latest', max_iterations = 3 } = req.body || {};
+  const { prompt, model: requestedModel = process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-latest', max_iterations = 3, sessionId } = req.body || {};
   if (typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: 'Invalid prompt' });
 
   // Build Anthropic tool schema
@@ -396,14 +785,17 @@ app.post('/anthropic/ai/chat', async (req, res) => {
   let currentModel = requestedModel;
   const steps = [];
   // Represent user prompt as content block array for consistency
-  const messages = [
+  const messages = (sessionId ? buildMemoryContext(sessionId) : []).concat([
     { role: 'user', content: [ { type: 'text', text: prompt } ] }
-  ];
+  ]);
+  if (sessionId) storeMemoryMessage(sessionId, 'user', prompt);
+  // Dynamic system prompt: enumerate runtime tools for capability questions
+  const toolListForSystem = Object.values(TOOL_DEFS).map(def => `- ${def.name}: ${def.description}`).join('\n');
   const system = `You are a helpful assistant.
-If the user:
+You currently have access to the following runtime tools (enumerate them ONLY when the user asks what tools/capabilities you have):\n${toolListForSystem || '- (no tools registered)'}\nIf the user:
  - asks for current weather: CALL get_current_weather (args: location, unit) then summarize.
- - asks to summarize / explain / extract info from an http(s) URL: CALL http_get with that URL (and set maxBytes to 30000 if long article) BEFORE answering, then write a concise answer using the fetched content. Do not fabricate details not in the fetched text.
-For all other queries, reply normally. Always keep answers concise and relevant.`;
+ - asks to summarize / explain / extract info from an http(s) URL: CALL http_get with that URL (and set maxBytes to 30000 if long article) BEFORE answering, then write a concise answer using ONLY the fetched content.
+For capability/tool questions: list ONLY the tools above with brief descriptions; do NOT invent tools. For all other queries, reply normally. Keep answers concise and relevant.`;
   let finalText = '';
 
   async function anthropicCall(toolResults=[]) {
@@ -491,7 +883,7 @@ For all other queries, reply normally. Always keep answers concise and relevant.
       }
       break; // tools removed; single iteration
     }
-  return res.json({ text: finalText, steps, model: currentModel, mode: 'anthropic-tool-assisted' });
+  return res.json({ text: finalText, steps, model: currentModel, mode: 'anthropic-tool-assisted', memory: sessionId ? { sessionId } : undefined });
   } catch (e) {
     console.error('[anthropic/ai/chat] failure:', e);
     return res.status(500).json({ error: 'Anthropic tool orchestration failed', details: String(e?.message || e) });

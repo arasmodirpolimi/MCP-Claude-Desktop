@@ -75,8 +75,18 @@ const WELCOME_MESSAGE_GROUP = [
   { role: "assistant", content: "Hello! How can I assist you right now?" },
 ];
 
-export function Chat({ messages, activeServerId, onToolResult }) {
+export function Chat({ messages, activeServerId, onToolResult, autoRunTools = true }) {
   const messagesEndRef = useRef(null);
+  const [sessionId] = useState(() => {
+    try {
+      const existing = typeof window !== 'undefined' ? window.localStorage.getItem('chat_session_id') : null;
+      if (existing && existing.length > 10) return existing;
+      const id = crypto.randomUUID();
+      if (typeof window !== 'undefined') window.localStorage.setItem('chat_session_id', id);
+      return id;
+    } catch { return Math.random().toString(36).slice(2); }
+  });
+  const [memoryStats, setMemoryStats] = useState({ messages: 0, summaries: 0, chars: 0 });
 
   // Robust grouping: start with one empty group, open a new group when we hit a user message
   const messagesGroups = useMemo(() => {
@@ -116,8 +126,87 @@ export function Chat({ messages, activeServerId, onToolResult }) {
     }
   }, [messages]);
 
+  // Fetch memory stats periodically (lightweight)
+  useEffect(() => {
+    let active = true;
+    async function load() {
+      try {
+        const base = import.meta.env.VITE_API_BASE || '';
+        const r = await fetch(`${base}/memory/${sessionId}`);
+        if (r.ok) {
+          const data = await r.json();
+          if (active) setMemoryStats({ messages: data.messages.length, summaries: data.summaries.length, chars: data.chars });
+        }
+      } catch {}
+    }
+    load();
+    const id = setInterval(load, 8000);
+    return () => { active = false; clearInterval(id); };
+  }, [sessionId]);
+
+  // Auto tool execution for structured tool_use events inserted into messages array
+  useEffect(() => {
+    if (!autoRunTools) return;
+    const pending = [];
+    for (const m of messages || []) {
+      if (m && m.role === 'assistant' && typeof m.content === 'object' && Array.isArray(m.content)) {
+        for (const block of m.content) {
+          if (block?.type === 'tool_use' && block?.name) {
+            pending.push({ name: block.name, args: block.input || {}, tool_use_id: block.id || block.tool_use_id });
+          }
+        }
+      }
+    }
+    if (!pending.length) return;
+    let cancelled = false;
+    (async () => {
+      for (const p of pending) {
+        if (cancelled) break;
+        try {
+          const serverId = activeServerId;
+          if (!serverId) continue;
+          const base = import.meta.env.VITE_API_BASE || '';
+          const res = await fetch(`${base}/api/mcp/servers/${serverId}/tool-call`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ toolName: p.name, arguments: p.args })
+          });
+          if (!res.ok) {
+            const txt = await res.text().catch(()=> '');
+            onToolResult?.({ error: `Auto tool ${p.name} failed: ${txt.slice(0,160)}` });
+            continue;
+          }
+          const data = await res.json();
+          const toolResult = data?.result;
+          const refined = await summarizeWithAnthropic({
+            toolName: p.name,
+            toolOutput: toolResult,
+            userPrompt: lastUserContent,
+            model: 'claude-3-5-sonnet-latest'
+          });
+          onToolResult?.(typeof refined === 'string' && refined.trim() ? refined.trim() : (typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult, null, 2)));
+        } catch (e) {
+          onToolResult?.({ error: `Auto tool ${p.name} error: ${String(e?.message || e)}` });
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [messages, autoRunTools, activeServerId, lastUserContent, onToolResult]);
+
+  async function handleClearMemory() {
+    try {
+      const base = import.meta.env.VITE_API_BASE || '';
+      await fetch(`${base}/memory/clear`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId }) });
+      setMemoryStats({ messages: 0, summaries: 0, chars: 0 });
+    } catch {}
+  }
+
   return (
     <div className={styles.Chat}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
+        <div style={{ fontSize:'0.7rem', opacity:0.8 }}>Session: {sessionId} • Mem msgs {memoryStats.messages} • summaries {memoryStats.summaries} • chars {memoryStats.chars}</div>
+        <button onClick={handleClearMemory} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>Clear Memory</button>
+      </div>
       {[WELCOME_MESSAGE_GROUP, ...messagesGroups].map((group, groupIndex) => (
         <div key={groupIndex} className={styles.Group}>
           {group.map(({ role, content }, index) => {

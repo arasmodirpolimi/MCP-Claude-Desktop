@@ -187,6 +187,29 @@ Debug Tips:
 * Rate limiting & usage metering dashboard
 * Theme toggle & accessibility contrast improvements
 * Streaming cancel button
+* External filesystem MCP server (spawn via npx) for rich file operations
+
+### Filesystem MCP Server Support
+Add an external MCP server providing filesystem tools (read/write/list/search/etc.). Create it by POSTing to `/api/mcp/servers` with type `filesystem`:
+
+```json
+{
+	"name": "fs",
+	"type": "filesystem",
+	"command": "npx",
+	"args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+}
+```
+
+The server responds with an id; fetch tools via `/api/mcp/servers/<id>/tools`.
+
+Currently returned tools (static enumeration):
+`read_file`, `write_file`, `append_file`, `list_directory`, `create_directory`, `delete_file`, `rename`, `move`, `copy`, `search`, `stat`, `read_json`, `write_json`, `tail_file`.
+
+Security cautions:
+- Do NOT expose filesystem server publicly without sandboxing.
+- Consider running in a restricted directory.
+- Future enhancement: real MCP handshake + dynamic tool parsing (list_tools) and path allow/deny lists.
 
 ## 17. Contributing
 1. Fork & branch: `git checkout -b feat/your-feature`.

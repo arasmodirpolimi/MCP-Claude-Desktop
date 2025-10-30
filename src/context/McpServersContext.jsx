@@ -58,6 +58,11 @@ export function McpServersProvider({ children }) {
       const cleaned = Array.isArray(raw) ? raw.filter(s => s && typeof s.id === 'string') : [];
       setServers(cleaned);
       try { localStorage.setItem('mcp_servers', JSON.stringify(cleaned)); } catch {}
+      // Purge stale local IDs if backend reports none
+      if (cleaned.length === 0) {
+        try { localStorage.removeItem('mcp_active_server'); } catch {}
+        setActiveServerId(null);
+      }
       if (!activeServerId && cleaned.length) setActiveServerId(cleaned[0].id);
     } catch (e) { setError(String(e.message || e)); }
     finally { setLoadingServers(false); }
@@ -65,9 +70,9 @@ export function McpServersProvider({ children }) {
 
   useEffect(() => { refreshServers(); }, [refreshServers]);
 
-  const addServer = useCallback(async (name, baseUrl) => {
+  const addServer = useCallback(async (name, baseUrl, type='embedded') => {
     setError(null);
-    const resp = await fetch(buildUrl('/api/mcp/servers'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, baseUrl }) });
+  const resp = await fetch(buildUrl('/api/mcp/servers'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, baseUrl, type }) });
     if (!resp.ok) throw new Error(`Add server failed ${resp.status}`);
     const text = await resp.text();
     if (/^\s*<!doctype/i.test(text)) throw new Error('HTML response (proxy misconfiguration) adding server');
@@ -99,15 +104,41 @@ export function McpServersProvider({ children }) {
 
   const fetchTools = useCallback(async (id) => {
     if (!id) return;
+    // Abort early if id not in current servers list to avoid hammering missing IDs
+    if (!servers.find(s => s.id === id)) {
+      console.warn('[MCP] fetchTools aborted; server id not present locally', id);
+      return;
+    }
     setLoadingTools(true); setError(null);
     try {
       const resp = await fetch(buildUrl(`/api/mcp/servers/${id}/tools`));
       if (resp.status === 404) {
-        console.warn('[MCP] tools 404 for server id', id, '— attempting silent re-create');
+        console.warn('[MCP] tools 404 for server id', id, '\u2014 attempting silent re-create with preserved type');
+        // Refresh server list once to ensure we are not using a stale local cache
+        try { await refreshServers(); } catch {}
         const stale = servers.find(s => s.id === id);
+        if (!stale) {
+          console.warn('[MCP] stale server id not found locally after refresh; aborting re-create');
+          return;
+        }
+        // Guard against infinite recreate loops: track prior id mapping
+        const priorIdsKey = 'mcp_recreated_ids';
+        let recreated = [];
+        try { const raw = localStorage.getItem(priorIdsKey); if (raw) recreated = JSON.parse(raw); } catch {}
+        if (recreated.includes(id)) {
+          console.warn('[MCP] already attempted re-create for id', id, 'skipping');
+          return;
+        }
+        recreated.push(id);
+        try { localStorage.setItem(priorIdsKey, JSON.stringify(recreated)); } catch {}
         if (stale) {
+          const preservedType = stale.type === 'filesystem-degraded' ? 'filesystem' : (stale.type || 'embedded');
           try {
-            const addResp = await fetch(buildUrl('/api/mcp/servers'), { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: stale.name, baseUrl: stale.baseUrl }) });
+            const addResp = await fetch(buildUrl('/api/mcp/servers'), {
+              method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({ name: stale.name, baseUrl: stale.baseUrl, type: preservedType })
+            });
             if (addResp.ok) {
               const txt = await addResp.text();
               let data; try { data = JSON.parse(txt); } catch {}
@@ -119,7 +150,8 @@ export function McpServersProvider({ children }) {
                   return next;
                 });
                 setActiveServerId(data.server.id);
-                // Retry once
+                console.info('[MCP] re-created server id', id, '->', data.server.id);
+                // Retry once with new id
                 try {
                   const retry = await fetch(buildUrl(`/api/mcp/servers/${data.server.id}/tools`));
                   if (retry.ok) {
@@ -139,25 +171,26 @@ export function McpServersProvider({ children }) {
             console.warn('[MCP] re-create failed', recreateErr);
           }
         }
-        // Silent failure: do not throw; just return undefined so UI doesn't show error banner
-        return;
+        return; // silent
       }
       if (!resp.ok) throw new Error(`List tools failed ${resp.status}`);
       const t = await resp.text();
       if (/^\s*<!doctype/i.test(t)) throw new Error('HTML response (proxy) when fetching tools');
       let data; try { data = JSON.parse(t); } catch { throw new Error('Invalid JSON fetching tools'); }
       const tools = data.tools || [];
-      setToolsByServer(m => ({ ...m, [id]: tools }));
+      // Ensure enabled flag present (fallback)
+      const normalized = tools.map(t => ({ ...t, enabled: t.enabled !== false }));
+      setToolsByServer(m => ({ ...m, [id]: normalized }));
       // Persist enabled flags returned by backend into our enabledTools map
       try {
         const map = {};
-        (tools || []).forEach(t => { if (t && t.name && t.enabled) map[t.name] = true; });
+        (normalized || []).forEach(t => { if (t && t.name && t.enabled) map[t.name] = true; });
         setEnabledForServer(id, map);
       } catch {}
-      return tools;
+      return normalized;
     } catch (e) { setError(String(e.message || e)); }
     finally { setLoadingTools(false); }
-  }, []);
+  }, [servers, refreshServers]);
 
   // Enable/disable tools per-server. Persist in localStorage for convenience.
   const setEnabledForServer = useCallback((serverId, newMap) => {

@@ -63,6 +63,35 @@ addTool({
   }
 });
 
+// Simple list_directory tool to enumerate files/directories at a given path (non-recursive)
+addTool({
+  name: 'list_directory',
+  description: 'List files and folders at a given relative or absolute path (non-recursive).',
+  inputSchema: z.object({
+    path: z.string().default('.').describe('Directory path to list (relative to server working dir if not absolute)')
+  }),
+  handler: async ({ path = '.' }) => {
+    const startedAt = Date.now();
+    let error; let summary; let entriesOut = [];
+    try {
+      if (typeof path !== 'string') throw new Error('Invalid path');
+      const fsMod = await import('fs/promises');
+      const stat = await fsMod.stat(path);
+      if (!stat.isDirectory()) throw new Error('Path is not a directory');
+      const entries = await fsMod.readdir(path, { withFileTypes: true });
+      entriesOut = entries.map(e => ({ name: e.name, type: e.isDirectory() ? 'dir' : 'file' }));
+      summary = `Listed ${entries.length} entries in ${path}`;
+      return { content: [ { type: 'text', text: `${summary}\n${entriesOut.map(e=>`${e.type}: ${e.name}`).join('\n')}` } ] };
+    } catch (e) {
+      error = String(e?.message || e);
+      summary = `list_directory error: ${error}`;
+      return { content: [ { type: 'text', text: summary } ] };
+    } finally {
+      TOOL_USAGE_LOG.push({ name: 'list_directory', args: { path }, startedAt, finishedAt: Date.now(), error: error || null, summary });
+    }
+  }
+});
+
 // Lightweight http_get tool for arbitrary GET requests. Exposes:
 // { url: string, headers?: Record<string,string>, maxBytes?: number }
 addTool({
@@ -96,6 +125,39 @@ addTool({
       return { content: [ { type: 'text', text: summary } ] };
     } finally {
       TOOL_USAGE_LOG.push({ name: 'http_get', args: { url, maxBytes }, startedAt, finishedAt: Date.now(), error: error || null, summary });
+    }
+  }
+});
+
+// Minimal write_file tool (dynamic registry) to allow assistant to create/overwrite files.
+// NOTE: Restricts writes to workspace root or subpaths; rejects path traversal outside CWD.
+addTool({
+  name: 'write_file',
+  description: 'Write (overwrite) a UTF-8 text file at a relative path within the server working directory.',
+  inputSchema: z.object({
+    path: z.string().describe('Relative file path (will be resolved within working directory)'),
+    content: z.string().describe('Text content to write')
+  }),
+  handler: async ({ path: rel, content }) => {
+    const startedAt = Date.now();
+    let error; let summary;
+    try {
+      if (typeof rel !== 'string' || !rel.trim()) throw new Error('Invalid path');
+      if (typeof content !== 'string') throw new Error('Invalid content');
+      const fsMod = await import('fs/promises');
+      const p = await import('path');
+      const root = process.cwd();
+      const abs = p.resolve(root, rel);
+      if (!abs.startsWith(root)) throw new Error('Path escapes root directory');
+      await fsMod.writeFile(abs, content, 'utf8');
+      summary = `Wrote file ${rel} (${content.length} chars)`;
+      return { content: [ { type: 'text', text: summary } ] };
+    } catch (e) {
+      error = String(e?.message || e);
+      summary = `write_file error: ${error}`;
+      return { content: [ { type: 'text', text: summary } ] };
+    } finally {
+      TOOL_USAGE_LOG.push({ name: 'write_file', args: { path: rel }, startedAt, finishedAt: Date.now(), error: error || null, summary });
     }
   }
 });
