@@ -21,6 +21,7 @@ function AppInner() {
   const [currentModel, setCurrentModel] = useState("");
   const [sessionId, setSessionId] = useState(null);
   const [activeToolExecs, setActiveToolExecs] = useState([]); // [{tool, startedAt, args, status, output}]
+  const [toolEvents, setToolEvents] = useState([]); // sequential log of tool actions for in-chat panel
   // Tools always enabled now (toggle removed)
   function clearMessages() {
     // Set to empty; Chat component injects the welcome group automatically so no duplicates
@@ -73,12 +74,14 @@ function AppInner() {
             setCurrentModel(evt.model || '');
           } else if (evt.type === 'tool_use') {
             // Add active execution entry
+            setToolEvents(prev => [...prev, { type:'use', tool: evt.tool, args: evt.args || {}, at: Date.now() }]);
             setActiveToolExecs(prev => [...prev.filter(e => e.tool !== evt.tool), { tool: evt.tool, startedAt: Date.now(), args: evt.args || {}, status: 'running' }]);
           } else if (evt.type === 'tool_result') {
-            addMessage({ role:'assistant', content: `Tool ${evt.tool} finished.` });
+            setToolEvents(prev => [...prev, { type:'result', tool: evt.tool, output: evt.output, at: Date.now() }]);
             setActiveToolExecs(prev => prev.map(e => e.tool === evt.tool ? { ...e, status: 'done', output: evt.output, finishedAt: Date.now() } : e));
           } else if (evt.type === 'tool_error') {
             addMessage({ role:'system', content: `Tool ${evt.tool} error: ${evt.error}` });
+            setToolEvents(prev => [...prev, { type:'error', tool: evt.tool, error: evt.error, at: Date.now() }]);
             setActiveToolExecs(prev => prev.map(e => e.tool === evt.tool ? { ...e, status: 'error', error: evt.error, finishedAt: Date.now() } : e));
           } else if (evt.type === 'error') {
             addMessage({ role:'system', content: 'Stream error: '+ evt.error });
@@ -89,10 +92,6 @@ function AppInner() {
       addMessage({ role:'system', content: 'Request failed: '+ String(e?.message || e) });
     } finally {
       setIsLoading(false); setIsStreaming(false); abortRef.current = null;
-      // Cleanup finished/error tool exec entries after slight delay
-      setTimeout(() => {
-        setActiveToolExecs(prev => prev.filter(e => e.status === 'running'));
-      }, 2500);
     }
   }
 
@@ -167,6 +166,7 @@ function AppInner() {
             isLoading={isLoading}
             isStreaming={isStreaming}
             activeToolExecs={activeToolExecs}
+            toolEvents={toolEvents}
             autoRunTools={true}
             onClearMemory={clearMessages}
           />
@@ -178,6 +178,7 @@ function AppInner() {
         onSend={handleContentSend}
         onCancel={handleCancelStream}
       />
+    {/* DebugPanel removed per request. Tool activity now shown inline inside chat. */}
   {/* Memory clear button triggers local chat clear by calling Chat's clear memory or App's helper (already wired via Chat) */}
     </div>
   );

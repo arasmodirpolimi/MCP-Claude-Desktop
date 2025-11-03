@@ -75,7 +75,7 @@ const WELCOME_MESSAGE_GROUP = [
   { role: "assistant", content: "Hello! How can I assist you right now?" },
 ];
 
-export function Chat({ messages, activeServerId, activeServerName = '', onToolResult, autoRunTools = true, sessionId: externalSessionId, isLoading = false, isStreaming = false, activeToolExecs = [], onClearMemory }) {
+export function Chat({ messages, activeServerId, activeServerName = '', onToolResult, autoRunTools = true, sessionId: externalSessionId, isLoading = false, isStreaming = false, activeToolExecs = [], toolEvents = [], onClearMemory }) {
   const messagesEndRef = useRef(null);
   const scrollRef = useRef(null);
   const [userNearBottom, setUserNearBottom] = useState(true);
@@ -346,8 +346,13 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
           <button onClick={handleClearMemory} style={{ fontSize:'0.65rem', padding:'2px 6px' }}>Clear Memory</button>
         </div>
       </div>
-      {showMemoryPanel && renderMemoryPanel()}
-      {[WELCOME_MESSAGE_GROUP, ...messagesGroups].map((group, groupIndex) => (
+    {showMemoryPanel && renderMemoryPanel()}
+      {[WELCOME_MESSAGE_GROUP, ...messagesGroups].map((group, groupIndex, all) => {
+        const isLatestGroup = groupIndex === all.length - 1;
+        const lastUserIndex = (() => {
+          let idx = -1; group.forEach((m,i)=> { if (m.role === 'user') idx = i; }); return idx;
+        })();
+        return (
         <div key={groupIndex} className={styles.Group}>
           {group.map(({ role, content }, index) => {
             const key = `${groupIndex}-${index}`;
@@ -392,11 +397,17 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
                     ))}
                   </div>
                 )}
+                {/* Inject ToolActivityPanel immediately after last user message of latest group */}
+                {toolEvents.length > 0 && isLatestGroup && index === lastUserIndex && role === 'user' && (
+                  <div style={{ marginTop:12 }}>
+                    <ToolActivityPanel toolEvents={toolEvents} activeToolExecs={activeToolExecs} />
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
-      ))}
+      ); })}
       {isLoading && (
         <div style={{ marginTop:4, marginBottom:8 }}>
           <div className={styles.Message} data-role='assistant' style={{ background:'transparent', boxShadow:'none', padding:'4px 8px' }}>
@@ -408,53 +419,6 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
       )}
       <div ref={messagesEndRef} />
       <div className={styles.BottomFade} />
-      {autoRunTools && activeToolExecs.length > 0 && (
-        <div className={styles.ToolExecContainer}>
-          {activeToolExecs.map(exec => {
-            const cls = [styles.ToolExecItem];
-            if (exec.status === 'done') cls.push('ToolExecDone');
-            if (exec.status === 'error') cls.push('ToolExecError');
-            const expanded = expandedTools[exec.tool];
-            const preview = (() => {
-              if (exec.output == null) return '';
-              const raw = typeof exec.output === 'string' ? exec.output : JSON.stringify(exec.output, null, 2);
-              return raw.length > 400 ? raw.slice(0,400) + '…' : raw;
-            })();
-            return (
-              <div key={exec.tool} className={cls.join(' ')}>
-                <div style={{ display:'flex', flexDirection:'column', width:'100%', gap:4 }}>
-                  <div className={styles.ToolExecMetaRow}>
-                    <span className={styles.ToolExecName}>{exec.tool}</span>
-                    <span className={styles.ToolExecElapsed}>{formatElapsed(exec)}</span>
-                  </div>
-                  <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                    <span className={styles.ToolExecStatus}>{exec.status === 'running' ? 'executing…' : exec.status}</span>
-                    <div style={{ flex:1 }} className={styles.ToolExecProgress} />
-                    {(exec.output || exec.error || exec.args) && (
-                      <button className={styles.ToolExecToggle} onClick={() => toggleExpand(exec.tool)}>{expanded ? 'Hide' : 'Details'}</button>
-                    )}
-                  </div>
-                  {expanded && (
-                    <div className={styles.ToolExecDetails}>
-                      {exec.args && Object.keys(exec.args).length > 0 && (
-                        <div style={{ marginBottom:4 }}><strong>Args:</strong> <code>{JSON.stringify(exec.args)}</code></div>
-                      )}
-                      {exec.error && (
-                        <div style={{ color:'#f87171', marginBottom:4 }}><strong>Error:</strong> {String(exec.error)}</div>
-                      )}
-                      {exec.output && (
-                        <div><strong>Output:</strong>
-                          <pre style={{ margin:0 }}>{preview}</pre>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
       {!userNearBottom && (
         <button
           onClick={()=> messagesEndRef.current?.scrollIntoView({ behavior:'smooth' })}
@@ -462,6 +426,100 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
         >Jump to latest ↓</button>
       )}
       {/* Removed Clear Chat View button per updated requirements */}
+    </div>
+  );
+}
+
+/** ToolActivityPanel: shows sequential tool events and current executions; collapsible/minimizable */
+function ToolActivityPanel({ toolEvents = [], activeToolExecs = [] }) {
+  const [open, setOpen] = useState(true);
+  const [showFinishedOutput, setShowFinishedOutput] = useState(false);
+  const recent = toolEvents.slice(-40); // cap entries for performance
+  const [expandedMap, setExpandedMap] = useState({}); // tool -> bool for details
+  function toggleTool(t){ setExpandedMap(prev => ({ ...prev, [t]: !prev[t] })); }
+  return (
+    <div style={{ marginBottom:12, border:'1px solid #2a2a2a', borderRadius:8, background:'#141414', overflow:'hidden' }}>
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 10px', background:'#1d1d1d', borderBottom: open ? '1px solid #222':'none' }}>
+        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+          <strong style={{ fontSize:'0.7rem' }}>Tool Activity</strong>
+          <span style={{ fontSize:'0.6rem', opacity:0.6 }}>({toolEvents.length} events)</span>
+        </div>
+        <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+          <label style={{ fontSize:'0.55rem', display:'flex', alignItems:'center', gap:4 }}>
+            <input type='checkbox' checked={showFinishedOutput} onChange={e=> setShowFinishedOutput(e.target.checked)} /> show output
+          </label>
+          <button onClick={()=> setOpen(o=> !o)} style={{ fontSize:'0.6rem', padding:'2px 8px', background:'#262626', color:'#ddd', border:'1px solid #333', borderRadius:4 }}>{open ? '−' : '+'}</button>
+        </div>
+      </div>
+      {open && (
+        <div style={{ maxHeight:180, overflowY:'auto', padding:'6px 10px', fontSize:'0.6rem', lineHeight:1.4 }}>
+          {recent.length === 0 && <div style={{ opacity:0.5 }}>No tool events yet.</div>}
+          {recent.map((e,i) => {
+            let line;
+            if (e.type === 'use') line = `I should call the following tool: ${e.tool}`;
+            else if (e.type === 'result') line = `Tool ${e.tool} finished.`;
+            else if (e.type === 'error') line = `Tool ${e.tool} error: ${String(e.error).slice(0,140)}`;
+            return (
+              <div key={i} style={{ padding:'2px 0', borderBottom:'1px solid #1a1a1a' }}>
+                <div>{line}</div>
+                {showFinishedOutput && e.type === 'result' && e.output != null && (
+                  <pre style={{ margin:'2px 0 4px', whiteSpace:'pre-wrap', background:'#101010', padding:'4px', borderRadius:4, maxHeight:120, overflowY:'auto' }}>{
+                    typeof e.output === 'string' ? e.output.slice(0,1000) : JSON.stringify(e.output, null, 2).slice(0,1000)
+                  }{(typeof e.output === 'string' ? e.output.length : JSON.stringify(e.output).length) > 1000 ? '…':''}</pre>
+                )}
+              </div>
+            );
+          })}
+          {/* Detailed executions list (all recent activeToolExecs, not only running) */}
+          {activeToolExecs.length > 0 && (
+            <div style={{ marginTop:8 }}>
+              <div style={{ fontWeight:600, marginBottom:4 }}>Execution Details</div>
+              <ul style={{ listStyle:'none', margin:0, padding:0 }}>
+                {activeToolExecs.map((exec, i) => {
+                  const expanded = expandedMap[exec.tool];
+                  const elapsed = (() => {
+                    const end = exec.finishedAt || Date.now();
+                    const ms = end - exec.startedAt;
+                    if (ms < 1000) return (ms/1000).toFixed(2)+'s';
+                    if (ms < 60000) return (ms/1000).toFixed(2)+'s';
+                    const s = Math.floor(ms/1000); const m = Math.floor(s/60); const r = s%60; return m+'m '+r+'s';
+                  })();
+                  const outputStr = exec.output == null ? '' : (typeof exec.output === 'string' ? exec.output : Array.isArray(exec.output) ? exec.output.map(o=> typeof o === 'string'? o: JSON.stringify(o)).join('\n') : JSON.stringify(exec.output, null, 2));
+                  return (
+                    <li key={i} style={{ border:'1px solid #1f1f1f', borderRadius:6, padding:'6px 8px', marginBottom:6, background:'#161616' }}>
+                      <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+                        <strong style={{ fontSize:'0.65rem' }}>{exec.tool}</strong>
+                        <span style={{ fontSize:'0.55rem', opacity:0.7 }}>{elapsed}</span>
+                        <span style={{ fontSize:'0.55rem', padding:'2px 6px', borderRadius:4, background: exec.status==='error'? '#7f1d1d':'#1e293b', color:'#ddd', textTransform:'uppercase' }}>{exec.status}</span>
+                        {(exec.args || exec.output || exec.error) && (
+                          <button onClick={()=> toggleTool(exec.tool)} style={{ fontSize:'0.55rem', padding:'2px 6px', background:'#272727', color:'#ddd', border:'1px solid #333', borderRadius:4 }}>
+                            {expanded? 'Hide' : 'Details'}
+                          </button>
+                        )}
+                      </div>
+                      {expanded && (
+                        <div style={{ marginTop:6 }}>
+                          {exec.args && Object.keys(exec.args).length > 0 && (
+                            <div style={{ marginBottom:4 }}><strong style={{ fontSize:'0.6rem' }}>Args:</strong> <code style={{ fontSize:'0.6rem' }}>{JSON.stringify(exec.args)}</code></div>
+                          )}
+                          {exec.error && (
+                            <div style={{ marginBottom:4, color:'#f87171', fontSize:'0.6rem' }}><strong>Error:</strong> {String(exec.error)}</div>
+                          )}
+                          {outputStr && (
+                            <div style={{ fontSize:'0.6rem' }}><strong>Output:</strong>
+                              <pre style={{ margin:'4px 0 0', maxHeight:160, overflowY:'auto', background:'#101010', padding:'6px', borderRadius:4, whiteSpace:'pre-wrap' }}>{outputStr}</pre>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
