@@ -21,6 +21,9 @@ This project is a front‑end focused multi‑provider AI chat client. It authen
 * Simple provider switching (instantiate different Assistant class)
 * Environment variable configuration via `import.meta.env`
 * Secure server / proxy endpoints for sensitive keys (recommended production pattern)
+* Built-in project code tools (`list_project_files`, `read_project_file`, `summarize_project`) to read and summarize source code without external filesystem server
+* Separated per-tool result cards in chat for clearer outputs (expanding/collapsing individual tool outputs)
+* Per-turn tool execution grouping: each user prompt is immediately followed by panels for that turn's tool activity (running executions + finished results), preserving chronological context
 
 ## 3. Project Structure (Essentials)
 ```
@@ -64,6 +67,14 @@ npm install
 npm run dev
 ```
 Open http://localhost:5173 and log in with a Supabase test user.
+
+### Reading Project Code In Chat
+You can ask the assistant to use the built-in code tools. Example prompts:
+* `List project files.` → invokes `list_project_files`
+* `Read the file src/components/Chat/Chat.jsx` → invokes `read_project_file`
+* `Summarize the project codebase` → invokes `summarize_project`
+
+Each tool execution now renders directly under the user message that triggered it. Running executions for the current turn appear in a live activity panel; finished executions show as independent expandable/collapsible cards with Close controls. Previous turns retain their finished tool result windows inline so you can scroll back through chronological tool usage without losing context.
 
 ## 7. Supabase Auth Setup
 1. In Supabase Dashboard: Authentication → Providers → enable Email.
@@ -305,6 +316,8 @@ Forward ports (3100 backend, 5173 frontend) and test streaming endpoints.
 | 404 on `/mcp` | Backend not deployed / wrong base | Verify backend URL; session header optional |
 | Assets 404 on Pages | Missing `base` | Set `base` to repo path |
 | 405 Not Allowed on `/anthropic/ai/chat-stream` | Static host (Pages) sees POST to nonexistent path | Set `VITE_API_BASE` to backend origin; fallback will use non-stream endpoint |
+| 529 Overloaded (Claude) | Anthropic temporary capacity issue | Automatic backoff retries (1s,2s,3s) now applied; simply re‑ask if still failing |
+| 404 Model not found | Requested model deprecated or typo | Automatic fallback attempts to candidate list; update configured model |
 
 ### Cloudflare Worker Integration (Backend Proxy)
 Deploying a Cloudflare Worker lets you host the minimal proxy endpoints at the edge. Steps:
@@ -329,6 +342,27 @@ Access-Control-Allow-Methods: GET, POST, OPTIONS
 Missing preflight or mismatched origin commonly produces a generic browser `TypeError: Failed to fetch`.
 
 ### Key Rotation & Leak Response
+### Anthropic Error Handling Improvements
+
+The server now performs limited automatic recovery for common Anthropic upstream failures:
+
+1. Overloaded (HTTP 529 / `overloaded_error`)
+	- Up to 3 attempts with incremental backoff (1s, 2s, 3s) before giving up.
+	- Returns JSON error payload with `classification: "overloaded"` for the basic stream endpoint or emits retry events in tool-aware mode.
+	- Recommended: wait a few seconds and retry; overloads are transient.
+
+2. Model Not Found (HTTP 404 / `not_found_error`)
+	- Automatic fallback across a candidate list (`claude-3-5-sonnet(-latest)`, `haiku`, `opus`).
+	- If all fallbacks fail, the error is returned with `classification: "not_found"`.
+	- Action: verify the `ANTHROPIC_MODEL` env or update to a currently available model.
+
+3. Generic Errors
+	- Other non-OK statuses are surfaced with `classification: "error"`.
+	- The first 400 characters of the upstream response body are included for context.
+
+Tool-aware streaming (`/anthropic/ai/chat-stream`) now emits structured `error` events containing the classification tokens in the message string. The client maps these to friendlier system messages.
+
+If you see repeated overloaded errors despite retries, consider lowering concurrency, using a lighter model (haiku), or adding a circuit-breaker that delays new requests for ~15s after a failure burst.
 If a provider key was exposed:
 1. Generate a new key immediately (provider dashboard).
 2. Update Worker/server secret and redeploy.

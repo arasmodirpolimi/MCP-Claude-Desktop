@@ -75,11 +75,10 @@ const WELCOME_MESSAGE_GROUP = [
   { role: "assistant", content: "Hello! How can I assist you right now?" },
 ];
 
-export function Chat({ messages, activeServerId, activeServerName = '', onToolResult, autoRunTools = true, sessionId: externalSessionId, isLoading = false, isStreaming = false, activeToolExecs = [], toolEvents = [], onClearMemory }) {
+export function Chat({ messages, activeServerId, activeServerName = '', onToolResult, autoRunTools = true, sessionId: externalSessionId, isLoading = false, isStreaming = false, activeToolExecs = [], toolEvents = [], userTurn = 0, onClearMemory }) {
   const messagesEndRef = useRef(null);
   const scrollRef = useRef(null);
   const [userNearBottom, setUserNearBottom] = useState(true);
-  const [expandedTools, setExpandedTools] = useState({}); // tool -> bool
   const [, forceTick] = useState(0); // for elapsed time re-render
   // Use externally provided sessionId (source of truth) or fall back once
   const [sessionId] = useState(() => {
@@ -155,17 +154,6 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
     // cleanup interval
     return () => { clearInterval(iv); el.removeEventListener('scroll', onScroll); };
   }, [updateUserNearBottom, activeToolExecs]);
-  function formatElapsed(exec) {
-    const end = exec.finishedAt || Date.now();
-    const ms = end - exec.startedAt;
-    if (ms < 1000) return (ms/1000).toFixed(2)+'s';
-    if (ms < 60000) return (ms/1000).toFixed(1)+'s';
-    const s = Math.floor(ms/1000);
-    const m = Math.floor(s/60); const rem = s%60;
-    return m + 'm ' + rem + 's';
-  }
-
-  function toggleExpand(tool) { setExpandedTools(prev => ({ ...prev, [tool]: !prev[tool] })); }
 
   // Memory clear now handled externally; ensure no duplicate greeting since we inject welcome group separately.
 
@@ -349,12 +337,9 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
     {showMemoryPanel && renderMemoryPanel()}
       {[WELCOME_MESSAGE_GROUP, ...messagesGroups].map((group, groupIndex, all) => {
         const isLatestGroup = groupIndex === all.length - 1;
-        const lastUserIndex = (() => {
-          let idx = -1; group.forEach((m,i)=> { if (m.role === 'user') idx = i; }); return idx;
-        })();
         return (
         <div key={groupIndex} className={styles.Group}>
-          {group.map(({ role, content }, index) => {
+          {group.map(({ role, content, turn }, index) => {
             const key = `${groupIndex}-${index}`;
 
             // Detect assistant-suggested tool lines like:
@@ -397,10 +382,13 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
                     ))}
                   </div>
                 )}
-                {/* Inject ToolActivityPanel immediately after last user message of latest group */}
-                {toolEvents.length > 0 && isLatestGroup && index === lastUserIndex && role === 'user' && (
+                {/* Per-turn tool windows: show finished executions for this message's turn; running only for current turn */}
+                {role === 'user' && (
                   <div style={{ marginTop:12 }}>
-                    <ToolActivityPanel toolEvents={toolEvents} activeToolExecs={activeToolExecs} />
+                    {isLatestGroup && turn === userTurn && (
+                      <ToolActivityPanel toolEvents={toolEvents.filter(e => e.turn === userTurn)} activeToolExecs={activeToolExecs.filter(e => e.turn === userTurn)} />
+                    )}
+                    <ToolExecutionWindows execs={activeToolExecs.filter(e => e.turn === (turn || 0) && e.status !== 'running')} />
                   </div>
                 )}
               </div>
@@ -437,6 +425,8 @@ function ToolActivityPanel({ toolEvents = [], activeToolExecs = [] }) {
   const recent = toolEvents.slice(-40); // cap entries for performance
   const [expandedMap, setExpandedMap] = useState({}); // tool -> bool for details
   function toggleTool(t){ setExpandedMap(prev => ({ ...prev, [t]: !prev[t] })); }
+  // Show only currently running executions here (finished results shown separately)
+  const runningExecs = activeToolExecs.filter(e => e.status === 'running');
   return (
     <div style={{ marginBottom:12, border:'1px solid #2a2a2a', borderRadius:8, background:'#141414', overflow:'hidden' }}>
       <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 10px', background:'#1d1d1d', borderBottom: open ? '1px solid #222':'none' }}>
@@ -470,12 +460,12 @@ function ToolActivityPanel({ toolEvents = [], activeToolExecs = [] }) {
               </div>
             );
           })}
-          {/* Detailed executions list (all recent activeToolExecs, not only running) */}
-          {activeToolExecs.length > 0 && (
+          {/* Running executions only (no finished to avoid duplication) */}
+          {runningExecs.length > 0 && (
             <div style={{ marginTop:8 }}>
               <div style={{ fontWeight:600, marginBottom:4 }}>Execution Details</div>
               <ul style={{ listStyle:'none', margin:0, padding:0 }}>
-                {activeToolExecs.map((exec, i) => {
+                {runningExecs.map((exec, i) => {
                   const expanded = expandedMap[exec.tool];
                   const elapsed = (() => {
                     const end = exec.finishedAt || Date.now();
@@ -518,6 +508,74 @@ function ToolActivityPanel({ toolEvents = [], activeToolExecs = [] }) {
               </ul>
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// New component: render EACH finished tool execution in an independent window panel
+function ToolExecutionWindows({ activeToolExecs = [], execs }) {
+  // Collapsible container: default collapsed per user request so tool output windows don't dominate the chat view.
+  // Header shows count of visible windows and allows restoring all closed windows.
+  const source = Array.isArray(execs) ? execs : activeToolExecs.filter(e => e.status === 'done' || e.status === 'error');
+  const finished = source;
+  const [hidden, setHidden] = useState({}); // tool -> true if user closed
+  const [expanded, setExpanded] = useState({}); // tool -> bool for full output
+  const [allCollapsed, setAllCollapsed] = useState(true); // default collapsed per user request
+  if (finished.length === 0) return null;
+  const visibleCount = finished.filter(f => !hidden[f.tool]).length;
+  return (
+    <div style={{ border:'1px solid #262626', borderRadius:8, background:'#151515', overflow:'hidden' }}>
+      {/* Header / Toggle */}
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 10px', background:'#1e1e1e', borderBottom: allCollapsed ? 'none':'1px solid #222' }}>
+        <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+          <strong style={{ fontSize:'0.65rem' }}>Tool Results</strong>
+          <span style={{ fontSize:'0.55rem', opacity:0.6 }}>({visibleCount} window{visibleCount===1?'':'s'})</span>
+        </div>
+        <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+          {visibleCount < finished.length && (
+            <button onClick={()=> setHidden({})} title='Restore closed windows' style={{ fontSize:'0.55rem', padding:'2px 6px', background:'#272727', color:'#ddd', border:'1px solid #333', borderRadius:4 }}>Restore</button>
+          )}
+          <button onClick={()=> setAllCollapsed(c => !c)} style={{ fontSize:'0.55rem', padding:'2px 8px', background:'#272727', color:'#ddd', border:'1px solid #333', borderRadius:4 }}>{allCollapsed ? 'Expand +' : 'Collapse −'}</button>
+        </div>
+      </div>
+      {!allCollapsed && (
+        <div style={{ padding:'10px 12px', display:'flex', flexDirection:'column', gap:10 }}>
+          {finished.map((e,i) => {
+            if (hidden[e.tool]) return null;
+            const isExpanded = expanded[e.tool];
+            const outputStr = e.output == null ? '' : (typeof e.output === 'string' ? e.output : JSON.stringify(e.output, null, 2));
+            const preview = outputStr.slice(0, 260) + (outputStr.length > 260 ? '…' : '');
+            return (
+              <div key={i} style={{ border:'1px solid #2d2d2d', borderRadius:8, background:'#121212', padding:'8px 10px', position:'relative' }}>
+                <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:8, flexWrap:'wrap' }}>
+                  <div style={{ display:'flex', flexDirection:'column', gap:2 }}>
+                    <strong style={{ fontSize:'0.65rem', wordBreak:'break-all' }}>{e.tool}</strong>
+                    <span style={{ fontSize:'0.55rem', opacity:0.65 }}>Status: {e.status}</span>
+                  </div>
+                  <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                    {outputStr && (
+                      <button onClick={()=> setExpanded(prev => ({ ...prev, [e.tool]: !prev[e.tool] }))} style={{ fontSize:'0.55rem', padding:'2px 6px', background:'#242424', color:'#ddd', border:'1px solid #333', borderRadius:4 }}>{isExpanded? 'Collapse' : 'Expand'}</button>
+                    )}
+                    <button onClick={()=> setHidden(prev => ({ ...prev, [e.tool]: true }))} style={{ fontSize:'0.55rem', padding:'2px 6px', background:'#3b3b3b', color:'#bbb', border:'1px solid #444', borderRadius:4 }}>Close</button>
+                  </div>
+                </div>
+                {outputStr && !isExpanded && (
+                  <pre style={{ margin:'6px 0 0', fontSize:'0.55rem', background:'#0d0d0d', padding:'6px', borderRadius:4, maxHeight:120, overflow:'auto', whiteSpace:'pre-wrap' }}>{preview}</pre>
+                )}
+                {isExpanded && (
+                  <pre style={{ margin:'6px 0 0', fontSize:'0.55rem', background:'#0d0d0d', padding:'6px', borderRadius:4, maxHeight:300, overflow:'auto', whiteSpace:'pre-wrap' }}>{outputStr}</pre>
+                )}
+                {e.error && (
+                  <div style={{ marginTop:6, fontSize:'0.55rem', color:'#f87171' }}>Error: {String(e.error)}</div>
+                )}
+                {e.args && Object.keys(e.args).length > 0 && (
+                  <div style={{ marginTop:6, fontSize:'0.5rem', opacity:0.6 }}>Args: <code>{JSON.stringify(e.args)}</code></div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

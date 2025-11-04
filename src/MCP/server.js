@@ -662,6 +662,92 @@ console.log(
   sessionServers.size
 );
 
+// ---------------- Optional built-in project code reading tools -----------------
+// User request: "read all the codes". We expose lightweight tools to list and read
+// workspace source files without requiring external filesystem MCP server.
+// These register once per backend start and are available on embedded servers.
+try {
+  const { addTool } = await import('./registerTools.js');
+  const projectRoot = process.cwd();
+  // list_project_files: recursively list files (excluding node_modules/.git) with optional ext filter
+  addTool({
+    name: 'list_project_files',
+    description: 'List project source file paths (excludes node_modules, .git). Optional ext filter (e.g. js, jsx, ts, css).',
+    inputSchema: z.object({ ext: z.string().optional().describe('Optional extension filter without dot, e.g. js') }),
+    handler: async ({ ext }) => {
+      const forbidden = new Set(['node_modules', '.git', 'dist', 'build']);
+      const results = [];
+      async function walk(dir) {
+        let entries = [];
+        try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+        for (const ent of entries) {
+          if (forbidden.has(ent.name)) continue;
+          const full = path.join(dir, ent.name);
+          if (ent.isDirectory()) { await walk(full); continue; }
+          if (ext && !full.endsWith('.' + ext)) continue;
+          results.push(path.relative(projectRoot, full));
+          if (results.length >= 500) return; // cap for safety
+        }
+      }
+      await walk(projectRoot);
+      return { content: [{ type: 'text', text: results.join('\n') || '(no files found)' }] };
+    }
+  });
+  // read_project_file: read UTF-8 text file with size cap & basic truncation
+  addTool({
+    name: 'read_project_file',
+    description: 'Read a UTF-8 project file by relative path. Returns truncated content if large.',
+    inputSchema: z.object({ path: z.string().describe('Relative file path'), maxBytes: z.number().optional().describe('Optional cap (default 20000)') }),
+    handler: async ({ path: rel, maxBytes }) => {
+      try {
+        const full = path.join(projectRoot, rel);
+        const data = await fs.readFile(full, 'utf8');
+        const cap = typeof maxBytes === 'number' && maxBytes > 0 ? maxBytes : 20000;
+        const out = data.length > cap ? data.slice(0, cap) + '\n... [truncated]' : data;
+        return { content: [{ type: 'text', text: out }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: 'Error reading file: ' + String(e?.message || e) }] };
+      }
+    }
+  });
+  // summarize_project: quick concatenation of small files for overview (size-limited)
+  addTool({
+    name: 'summarize_project',
+    description: 'Return a concatenated overview of small source files (<= 4KB each) capped at ~24KB total.',
+    inputSchema: z.object({}).describe('No arguments'),
+    handler: async () => {
+      const forbidden = new Set(['node_modules', '.git', 'dist', 'build']);
+      const parts = [];
+      let total = 0;
+      async function walk(dir) {
+        if (total > 24000) return;
+        let entries = [];
+        try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+        for (const ent of entries) {
+          if (forbidden.has(ent.name)) continue;
+          const full = path.join(dir, ent.name);
+          if (ent.isDirectory()) { await walk(full); continue; }
+          try {
+            const data = await fs.readFile(full, 'utf8');
+            if (data.length <= 4000 && /\.(jsx?|tsx?|css|json|html)$/.test(ent.name)) {
+              const header = `\n/* File: ${path.relative(projectRoot, full)} */\n`;
+              const chunk = header + data + '\n';
+              if (total + chunk.length > 24000) return; // stop before exceeding cap
+              parts.push(chunk);
+              total += chunk.length;
+            }
+          } catch {}
+        }
+      }
+      await walk(projectRoot);
+      return { content: [{ type: 'text', text: parts.join('').trim() || '(no summary produced)' }] };
+    }
+  });
+  console.log('[MCP] Project code tools registered: list_project_files, read_project_file, summarize_project');
+} catch (e) {
+  console.warn('[MCP] Failed registering project code tools', e?.message || e);
+}
+
 // ---------------- Chat Memory Store ----------------------------------------
 // Per-session conversational memory. In-memory Map (can swap to Redis or DB later).
 // Shape: memoryMap[sessionId] = { messages: [ { role, content, ts } ], summaries: [ { content, ts } ], chars }
@@ -1451,200 +1537,111 @@ app.post('/admin/mcp/sync', async (req, res) => {
 // SSE endpoint: /anthropic/chat { prompt, model?, max_tokens? }
 app.post("/anthropic/chat", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  const {
-    prompt,
-    model: requestedModel,
-    max_tokens = 512,
-    sessionId,
-  } = req.body || {};
-  const defaultModel =
-    process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
+  const { prompt, model: requestedModel, max_tokens = 512, sessionId } = req.body || {};
+  const defaultModel = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
   let model = requestedModel || defaultModel;
-  if (typeof prompt !== "string" || !prompt.trim()) {
-    return res.status(400).json({ error: "Invalid prompt" });
-  }
-  // Prepend memory context if provided
+  if (typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: 'Invalid prompt' });
   const memoryMessages = sessionId ? buildMemoryContext(sessionId) : [];
-  // Build dynamic tool schema only if header present (tool usage toggle)
   const forceEnable = req.headers['x-force-enable-tools'] === '1';
   const tools = forceEnable ? buildAnthropicTools() : [];
-  const toolListForSystem = Object.values(TOOL_DEFS)
-    .map((def) => `- ${def.name}: ${def.description}`)
-    .join("\n");
-  const system = `You are a helpful assistant.\nRuntime tools available (list ONLY when the user explicitly asks about tools/capabilities):\n${forceEnable ? (toolListForSystem || '- (no tools registered)') : '- (tools disabled for this request)'}\nGuidelines:\n- Do NOT invent tools.\n- When tools are disabled, answer using existing knowledge and clarify limitations if fresh data required.`;
-  if (sessionId) {
-    // Store user message before model call
-    storeMemoryMessage(sessionId, "user", prompt);
-  }
-  let aggregatedAssistant = "";
+  const toolListForSystem = Object.values(TOOL_DEFS).map(d => `- ${d.name}: ${d.description}`).join('\n');
+  const system = `You are a helpful assistant.\nRuntime tools available (list ONLY when user explicitly asks):\n${forceEnable ? (toolListForSystem || '- (no tools registered)') : '- (tools disabled for this request)'}\nGuidelines:\n- Do NOT invent tools.\n- When tools disabled, answer using existing knowledge.`;
+  if (sessionId) storeMemoryMessage(sessionId, 'user', prompt);
+  let aggregatedAssistant = '';
   if (!apiKey) {
-    // Mock stream fallback for local dev without key
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
+    // mock SSE
+    res.setHeader('Content-Type','text/event-stream');
+    res.setHeader('Cache-Control','no-cache');
+    res.setHeader('Connection','keep-alive');
     res.flushHeaders?.();
-    const fake = [
-      "Mock response: no ANTHROPIC_API_KEY set.",
-      "Set the key to receive real Claude streaming tokens.",
-    ];
+    const fake = [ 'Mock response: no ANTHROPIC_API_KEY set.', 'Set the key to receive real Claude streaming tokens.' ];
     for (const chunk of fake) {
       res.write(`data: ${JSON.stringify({ delta: chunk })}\n\n`);
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise(r=> setTimeout(r,300));
     }
-    res.write("data: [DONE]\n\n");
+    res.write('data: [DONE]\n\n');
     return res.end();
   }
   try {
-    // Helper: produce ordered list of candidate models for fallback
     function getModelCandidates(primary) {
       const envRaw = process.env.ANTHROPIC_MODEL_CANDIDATES;
-      const base = envRaw ? envRaw.split(/[,\s]+/).filter(Boolean) : [
-        "claude-3-5-sonnet",
-        "claude-3-5-sonnet-latest",
-        "claude-3-5-haiku",
-        "claude-3-5-haiku-latest",
-        "claude-3-opus",
-        "claude-3-opus-latest"
+      const base = envRaw ? envRaw.split(/[\,\s]+/).filter(Boolean) : [
+        'claude-3-5-sonnet','claude-3-5-sonnet-latest','claude-3-5-haiku','claude-3-5-haiku-latest','claude-3-opus','claude-3-opus-latest'
       ];
-      const dedup = [];
+      const out = [];
       const seen = new Set();
-      if (primary && !seen.has(primary)) { dedup.push(primary); seen.add(primary); }
-      for (const m of base) { if (!seen.has(m)) { dedup.push(m); seen.add(m); } }
-      return dedup;
+      if (primary && !seen.has(primary)) { out.push(primary); seen.add(primary); }
+      for (const m of base) if (!seen.has(m)) { out.push(m); seen.add(m); }
+      return out;
     }
-    // Optional cached model list from Anthropic
+    // Cached model list (optional)
     let cachedModelList = globalThis.__anthropic_model_list_cache__ || null;
     const nowTs = Date.now();
-    if (!cachedModelList || (nowTs - cachedModelList.ts) > 5 * 60 * 1000) {
+    if (!cachedModelList || (nowTs - cachedModelList.ts) > 5*60*1000) {
       try {
-        if (apiKey) {
-          const listResp = await fetch("https://api.anthropic.com/v1/models", { headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" } });
-          if (listResp.ok) {
-            const data = await listResp.json().catch(()=>null);
-            const names = Array.isArray(data?.data) ? data.data.map(d => d.id).filter(Boolean) : [];
-            cachedModelList = { ts: nowTs, names };
-            globalThis.__anthropic_model_list_cache__ = cachedModelList;
-          }
+        const listResp = await fetch('https://api.anthropic.com/v1/models',{ headers:{'x-api-key':apiKey,'anthropic-version':'2023-06-01'} });
+        if (listResp.ok) {
+          const data = await listResp.json().catch(()=>null);
+          const names = Array.isArray(data?.data) ? data.data.map(d=> d.id).filter(Boolean) : [];
+          cachedModelList = { ts: nowTs, names }; globalThis.__anthropic_model_list_cache__ = cachedModelList;
         }
       } catch {}
     }
     const availableNames = cachedModelList?.names || [];
     function pickFallback(tried) {
       const candidates = getModelCandidates(model);
-      for (const cand of candidates) {
-        if (tried.includes(cand)) continue;
-        // If we have a list of available names, prefer ones present
-        if (availableNames.length && !availableNames.includes(cand)) continue;
-        return cand;
+      for (const c of candidates) {
+        if (tried.includes(c)) continue;
+        if (availableNames.length && !availableNames.includes(c)) continue;
+        return c;
       }
       return null;
     }
     async function callAnthropic(modelName) {
-      const body = {
-        model: modelName,
-        max_tokens,
-        messages: memoryMessages.concat([{ role: "user", content: prompt }]),
-        system,
-        tools, // allow Claude to enumerate / potentially call tools (multi-turn orchestration not yet implemented here)
-        stream: true,
-      };
-      return await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
+      const body = { model: modelName, max_tokens, messages: memoryMessages.concat([{ role:'user', content: prompt }]), system, tools, stream:true };
+      return fetch('https://api.anthropic.com/v1/messages', { method:'POST', headers:{'x-api-key':apiKey,'anthropic-version':'2023-06-01','content-type':'application/json'}, body: JSON.stringify(body) });
     }
-    let upstream = await callAnthropic(model);
+    let upstream; let attempts = 0;
+    while (attempts < 3) {
+      upstream = await callAnthropic(model);
+      if (upstream.status === 529) { attempts++; await new Promise(r=> setTimeout(r, attempts*1000)); continue; }
+      break;
+    }
     if (!upstream.ok && upstream.status === 404) {
-      const tried = [model];
-      let fb;
-      while ((fb = pickFallback(tried))) {
-        tried.push(fb);
-        const attempt = await callAnthropic(fb);
-        if (attempt.ok) { upstream = attempt; model = fb; break; }
-      }
+      const tried=[model]; let fb;
+      while ((fb = pickFallback(tried))) { tried.push(fb); upstream = await callAnthropic(fb); if (upstream.ok) { model = fb; break; } }
     }
     if (!upstream.ok || !upstream.body) {
-      let details = "";
-      try {
-        details = await upstream.text();
-      } catch {}
-      return res
-        .status(upstream.status)
-        .json({
-          error: `Anthropic upstream error ${upstream.status}`,
-          modelTried: model,
-          fallbackAttempted: upstream.status === 404,
-          details: details.slice(0, 400),
-        });
+      let details=''; try { details = await upstream.text(); } catch {}
+      const status = upstream.status; const classification = status===529?'overloaded':(status===404?'not_found':'error');
+      return res.status(status).json({ error:`Anthropic upstream error ${status}`, classification, modelTried:model, details: details.slice(0,400) });
     }
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
+    res.setHeader('Content-Type','text/event-stream');
+    res.setHeader('Cache-Control','no-cache');
+    res.setHeader('Connection','keep-alive');
     res.flushHeaders?.();
-    const reader = upstream.body.getReader();
-    let cancelled = false;
-    req.on("close", () => {
-      cancelled = true;
-      try {
-        reader.cancel();
-      } catch {}
-    });
-    const decoder = new TextDecoder();
-    let buffer = "";
+    const reader = upstream.body.getReader(); let cancelled=false;
+    req.on('close', ()=> { cancelled=true; try { reader.cancel(); } catch {} });
+    const decoder = new TextDecoder(); let buffer='';
     while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (cancelled) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split(/\n/);
-      buffer = lines.pop() || "";
+      const { value, done } = await reader.read(); if (done) break; if (cancelled) break;
+      buffer += decoder.decode(value,{ stream:true });
+      const lines = buffer.split(/\n/); buffer = lines.pop() || '';
       for (const raw of lines) {
-        const line = raw.trim();
-        if (!line) continue;
-        if (line === "data: [DONE]") {
-          res.write("data: [DONE]\n\n");
-          return res.end();
-        }
-        if (!line.startsWith("data:")) continue;
+        const line = raw.trim(); if (!line) continue; if (!line.startsWith('data:')) continue;
+        if (line === 'data: [DONE]') { res.write('data: [DONE]\n\n'); return res.end(); }
         try {
           const payload = JSON.parse(line.slice(5));
-          // Pass through tool_use events as discrete SSE messages for client awareness
-          if (payload?.type === 'tool_use') {
-            res.write(`data: ${JSON.stringify({ tool_use: payload })}\n\n`);
-          }
-          const delta =
-            payload?.delta?.text ||
-            payload?.content_block?.text ||
-            payload?.text ||
-            (payload?.type === "content_block_delta" &&
-            payload?.delta?.type === "text_delta"
-              ? payload?.delta?.text
-              : "");
-          if (delta) {
-            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
-            if (sessionId) {
-              // Accumulate assistant text for memory after stream completes
-              aggregatedAssistant += delta;
-            }
-          }
+          if (payload?.type === 'tool_use') res.write(`data: ${JSON.stringify({ tool_use: payload })}\n\n`);
+          const delta = payload?.delta?.text || payload?.content_block?.text || payload?.text || (payload?.type==='content_block_delta' && payload?.delta?.type==='text_delta' ? payload?.delta?.text : '');
+          if (delta) { res.write(`data: ${JSON.stringify({ delta })}\n\n`); if (sessionId) aggregatedAssistant += delta; }
         } catch {}
       }
     }
-    if (sessionId && aggregatedAssistant.trim()) {
-      storeMemoryMessage(sessionId, "assistant", aggregatedAssistant.trim());
-    }
-    res.write("data: [DONE]\n\n");
-    res.end();
-  } catch (e) {
-    if (!res.headersSent)
-      res
-        .status(500)
-        .json({ error: "Proxy failure", details: String(e?.message || e) });
+    if (sessionId && aggregatedAssistant.trim()) storeMemoryMessage(sessionId,'assistant', aggregatedAssistant.trim());
+    res.write('data: [DONE]\n\n'); res.end();
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error:'Proxy failure', details: String(err?.message || err) });
   }
 });
 
@@ -1919,29 +1916,34 @@ ${forceEnable3 ? 'You currently have access to the following runtime tools (enum
   let finalText = "";
 
   async function anthropicCall(toolResults = []) {
-    // Anthropic expects messages with role user/assistant only. Tool results are passed via content blocks of type 'tool_result'.
-    const body = {
-      model: currentModel,
-      max_tokens: 512,
-      system,
-      messages: messages.concat(toolResults),
-      tools,
-      // Use "auto" tool choice implicitly; Anthropic will decide
-    };
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      let details = await r.text().catch(()=>"");
+    // Retry/backoff wrapper for non-stream tool endpoint
+    const MAX_RETRIES = 2;
+    let attempt = 0;
+    let lastStatus = 0;
+    let lastDetails = '';
+    while (attempt <= MAX_RETRIES) {
+      const body = {
+        model: currentModel,
+        max_tokens: 512,
+        system,
+        messages: messages.concat(toolResults),
+        tools,
+      };
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      lastStatus = r.status;
+      if (r.ok) return await r.json();
+      lastDetails = await r.text().catch(() => "");
       if (r.status === 404) {
         const envRaw = process.env.ANTHROPIC_MODEL_CANDIDATES;
-        const base = envRaw ? envRaw.split(/[,\s]+/).filter(Boolean) : [
+        const base = envRaw ? envRaw.split(/[\,\s]+/).filter(Boolean) : [
           "claude-3-5-sonnet",
           "claude-3-5-sonnet-latest",
           "claude-3-5-haiku",
@@ -1964,10 +1966,17 @@ ${forceEnable3 ? 'You currently have access to the following runtime tools (enum
           });
           if (r2.ok) { currentModel = cand; return await r2.json(); }
         }
+        break; // fallback exhaustion
       }
-      throw new Error(`Anthropic upstream error ${r.status}: ${details.slice(0,200)}`);
+      if (r.status === 529 && attempt < MAX_RETRIES) {
+        await new Promise(rz => setTimeout(rz, (attempt + 1) * 1000));
+        attempt++;
+        continue;
+      }
+      break;
     }
-    return await r.json();
+    const classification = lastStatus === 529 ? 'overloaded' : (lastStatus === 404 ? 'not_found' : 'generic');
+    throw new Error(`[${classification}] Anthropic upstream error ${lastStatus}: ${lastDetails.slice(0,200)}`);
   }
 
   // Mock path: directly decide whether to call tool

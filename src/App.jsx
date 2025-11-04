@@ -20,8 +20,9 @@ function AppInner() {
   const abortRef = useRef(null);
   const [currentModel, setCurrentModel] = useState("");
   const [sessionId, setSessionId] = useState(null);
-  const [activeToolExecs, setActiveToolExecs] = useState([]); // [{tool, startedAt, args, status, output}]
-  const [toolEvents, setToolEvents] = useState([]); // sequential log of tool actions for in-chat panel
+  const [activeToolExecs, setActiveToolExecs] = useState([]); // [{tool, startedAt, args, status, output, turn}]
+  const [toolEvents, setToolEvents] = useState([]); // sequential log of tool actions for in-chat panel (with turn)
+  const [userTurn, setUserTurn] = useState(0); // increments per user message
   // Tools always enabled now (toggle removed)
   function clearMessages() {
     // Set to empty; Chat component injects the welcome group automatically so no duplicates
@@ -53,7 +54,10 @@ function AppInner() {
   }
 
   async function handleContentSend(content, opts = {}) {
-    addMessage({ role:'user', content });
+    // Increment turn and tag user message
+    const nextTurn = userTurn + 1;
+    setUserTurn(nextTurn);
+    addMessage({ role:'user', content, turn: nextTurn });
     setIsLoading(true); setIsStreaming(true); abortRef.current = new AbortController();
     let assistantIndex = -1;
     try {
@@ -66,22 +70,22 @@ function AppInner() {
         onEvent: (evt) => {
           if (evt.type === 'assistant_text') {
             if (assistantIndex === -1) {
-              setMessages(prev => { assistantIndex = prev.length; return [...prev, { role:'assistant', content: evt.text }]; });
+              setMessages(prev => { assistantIndex = prev.length; return [...prev, { role:'assistant', content: evt.text, turn: nextTurn }]; });
             } else {
               setMessages(prev => prev.map((m,i)=> i===assistantIndex ? { ...m, content: m.content + evt.text } : m));
             }
           } else if (evt.type === 'model_used') {
             setCurrentModel(evt.model || '');
           } else if (evt.type === 'tool_use') {
-            // Add active execution entry
-            setToolEvents(prev => [...prev, { type:'use', tool: evt.tool, args: evt.args || {}, at: Date.now() }]);
-            setActiveToolExecs(prev => [...prev.filter(e => e.tool !== evt.tool), { tool: evt.tool, startedAt: Date.now(), args: evt.args || {}, status: 'running' }]);
+            // Add active execution entry with turn
+            setToolEvents(prev => [...prev, { type:'use', tool: evt.tool, args: evt.args || {}, at: Date.now(), turn: nextTurn }]);
+            setActiveToolExecs(prev => [...prev.filter(e => e.tool !== evt.tool), { tool: evt.tool, startedAt: Date.now(), args: evt.args || {}, status: 'running', turn: nextTurn }]);
           } else if (evt.type === 'tool_result') {
-            setToolEvents(prev => [...prev, { type:'result', tool: evt.tool, output: evt.output, at: Date.now() }]);
+            setToolEvents(prev => [...prev, { type:'result', tool: evt.tool, output: evt.output, at: Date.now(), turn: nextTurn }]);
             setActiveToolExecs(prev => prev.map(e => e.tool === evt.tool ? { ...e, status: 'done', output: evt.output, finishedAt: Date.now() } : e));
           } else if (evt.type === 'tool_error') {
             addMessage({ role:'system', content: `Tool ${evt.tool} error: ${evt.error}` });
-            setToolEvents(prev => [...prev, { type:'error', tool: evt.tool, error: evt.error, at: Date.now() }]);
+            setToolEvents(prev => [...prev, { type:'error', tool: evt.tool, error: evt.error, at: Date.now(), turn: nextTurn }]);
             setActiveToolExecs(prev => prev.map(e => e.tool === evt.tool ? { ...e, status: 'error', error: evt.error, finishedAt: Date.now() } : e));
           } else if (evt.type === 'error') {
             addMessage({ role:'system', content: 'Stream error: '+ evt.error });
@@ -167,6 +171,7 @@ function AppInner() {
             isStreaming={isStreaming}
             activeToolExecs={activeToolExecs}
             toolEvents={toolEvents}
+            userTurn={userTurn}
             autoRunTools={true}
             onClearMemory={clearMessages}
           />
