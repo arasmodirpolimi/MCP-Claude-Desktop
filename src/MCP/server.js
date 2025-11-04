@@ -1772,45 +1772,53 @@ ${forceEnable2 ? 'You currently have access to the following runtime tools (enum
           id: toolId,
           iteration: iter,
         });
-  const originalName = mapAnthropicToolNameBack(toolName);
-  const def = TOOL_DEFS[originalName];
+        // ---- User Approval Gating ----
+        try {
+          const decision = await waitForToolDecision(toolId);
+          if (decision === 'cancel') {
+            send({ type: 'tool_error', tool: toolName, id: toolId, error: 'User cancelled tool' });
+            // Provide a synthetic tool_result block so Anthropic sees completion of tool_use
+            send({ type: 'tool_result', tool: toolName, id: toolId, output: 'User cancelled tool', canceled: true });
+            collectedResults.push({ type: 'tool_result', tool_use_id: toolId, content: [{ type:'text', text: 'User cancelled tool' }], is_error: true });
+            continue;
+          }
+        } catch (e) {
+          // If waiting fails, treat as cancellation
+          send({ type: 'tool_error', tool: toolName, id: toolId, error: 'Approval wait failed: ' + String(e?.message || e) });
+          send({ type: 'tool_result', tool: toolName, id: toolId, output: 'Tool approval wait failed; treated as cancel', canceled: true });
+          collectedResults.push({ type: 'tool_result', tool_use_id: toolId, content: [{ type:'text', text: 'Tool approval wait failed; treated as cancel' }], is_error: true });
+          continue;
+        }
+        const originalName = mapAnthropicToolNameBack(toolName);
+        const def = TOOL_DEFS[originalName];
         if (!def) {
-          send({
-            type: "tool_error",
-            tool: toolName,
-            error: "Tool not registered",
-          });
+          send({ type: 'tool_error', tool: toolName, id: toolId, error: 'Tool not registered' });
           continue;
         }
         try {
           const result = await def.handler(toolArgs);
-          // result.content is an array of blocks; convert to string snippet
           const textOut = Array.isArray(result?.content)
-            ? result.content.map((c) => c.text || "").join("\n")
+            ? result.content.map((c) => c.text || '').join('\n')
             : JSON.stringify(result);
-          send({
-            type: "tool_result",
-            tool: toolName,
-            id: toolId,
-            output: textOut.slice(0, 4000),
-          });
-          collectedResults.push({
-            type: "tool_result",
-            tool_use_id: toolId,
-            content: [{ type: "text", text: textOut.slice(0, 8000) }],
-          });
+          send({ type: 'tool_result', tool: toolName, id: toolId, output: textOut.slice(0,4000) });
+          collectedResults.push({ type: 'tool_result', tool_use_id: toolId, content: [{ type:'text', text: textOut.slice(0,8000) }] });
         } catch (err) {
-          send({
-            type: "tool_error",
-            tool: toolName,
-            id: toolId,
-            error: String(err?.message || err),
-          });
+          send({ type: 'tool_error', tool: toolName, id: toolId, error: String(err?.message || err) });
         }
       }
       if (collectedResults.length) {
         // Anthropic requires tool_result blocks inside a user role message
         messages.push({ role: "user", content: collectedResults });
+        // If every tool_result reflects a user cancellation or cancellation placeholder, emit minimal assistant response and stop.
+        const allCancelled = collectedResults.every(r => {
+          const txt = (r.content?.[0]?.text || '').toLowerCase();
+          return /(user\s+cancel|user\s+cancelled|approval wait failed|treated as cancel)/.test(txt);
+        });
+        if (allCancelled) {
+          finalText = 'Operation cancelled.';
+          send({ type: 'assistant_text', text: finalText });
+          break;
+        }
       }
       // Continue loop to let model observe tool results
       continue;
@@ -1838,6 +1846,116 @@ ${forceEnable2 ? 'You currently have access to the following runtime tools (enum
     storeMemoryMessage(sessionId, "assistant", finalText.trim());
   send({ type: "done", final: finalText.slice(0, 8000) });
   return res.end();
+});
+
+// ---------------- Tool approval gating helpers & endpoints -----------------
+// Map of toolId -> { resolve, createdAt }
+const _pendingToolDecisions = new Map();
+function waitForToolDecision(toolId, { timeoutMs = 5 * 60 * 1000 } = {}) {
+  return new Promise((resolve, reject) => {
+    try {
+      const existing = _pendingToolDecisions.get(toolId);
+      if (existing) { return reject(new Error('Duplicate pending tool id')); }
+      const entry = { resolve, createdAt: Date.now() };
+      _pendingToolDecisions.set(toolId, entry);
+      const to = setTimeout(() => {
+        if (_pendingToolDecisions.get(toolId) === entry) {
+          _pendingToolDecisions.delete(toolId);
+          resolve('cancel'); // auto-cancel on timeout
+        }
+      }, timeoutMs);
+      entry.timeout = to;
+    } catch (e) { reject(e); }
+  });
+}
+
+app.post('/anthropic/ai/approve-tool', (req, res) => {
+  const { toolId } = req.body || {};
+  if (!toolId) return res.status(400).json({ error: 'Missing toolId' });
+  let entry = _pendingToolDecisions.get(toolId);
+  // Fallback: if direct id not found and user sent plain tool name, attempt heuristic match
+  if (!entry) {
+    // If exactly one pending decision and toolId matches prefix before '-', allow that
+    const keys = [..._pendingToolDecisions.keys()];
+    if (keys.length === 1 && keys[0].startsWith(toolId + '-')) entry = _pendingToolDecisions.get(keys[0]);
+    else if (!entry) {
+      // Otherwise try to find first key whose prefix matches toolId
+      const matchKey = keys.find(k => k.startsWith(toolId + '-'));
+      if (matchKey) entry = _pendingToolDecisions.get(matchKey);
+    }
+    if (entry) {
+      // Normalize toolId to actual key for downstream response
+      req.body.toolId = keys.find(k => _pendingToolDecisions.get(k) === entry) || toolId;
+    }
+  }
+  if (!entry) return res.status(404).json({ error: 'No pending decision for toolId', pending: [..._pendingToolDecisions.keys()] });
+  _pendingToolDecisions.delete(toolId);
+  try { clearTimeout(entry.timeout); } catch {}
+  entry.resolve('allow');
+  return res.json({ ok: true, toolId, decision: 'allow' });
+});
+
+app.post('/anthropic/ai/cancel-tool', (req, res) => {
+  const { toolId } = req.body || {};
+  if (!toolId) return res.status(400).json({ error: 'Missing toolId' });
+  let entry = _pendingToolDecisions.get(toolId);
+  if (!entry) {
+    const keys = [..._pendingToolDecisions.keys()];
+    if (keys.length === 1 && keys[0].startsWith(toolId + '-')) entry = _pendingToolDecisions.get(keys[0]);
+    else if (!entry) {
+      const matchKey = keys.find(k => k.startsWith(toolId + '-'));
+      if (matchKey) entry = _pendingToolDecisions.get(matchKey);
+    }
+    if (entry) req.body.toolId = keys.find(k => _pendingToolDecisions.get(k) === entry) || toolId;
+  }
+  if (!entry) return res.status(404).json({ error: 'No pending decision for toolId', pending: [..._pendingToolDecisions.keys()] });
+  _pendingToolDecisions.delete(toolId);
+  try { clearTimeout(entry.timeout); } catch {}
+  entry.resolve('cancel');
+  return res.json({ ok: true, toolId, decision: 'cancel' });
+});
+
+// Provide duplicate endpoints under /api prefix for development proxy setups that only forward /api/*
+app.post('/api/anthropic/ai/approve-tool', (req, res) => {
+  req.url = '/anthropic/ai/approve-tool'; // not strictly needed, just for logging clarity
+  const { toolId } = req.body || {};
+  if (!toolId) return res.status(400).json({ error: 'Missing toolId' });
+  let entry = _pendingToolDecisions.get(toolId);
+  if (!entry) {
+    const keys = [..._pendingToolDecisions.keys()];
+    if (keys.length === 1 && keys[0].startsWith(toolId + '-')) entry = _pendingToolDecisions.get(keys[0]);
+    else {
+      const matchKey = keys.find(k => k.startsWith(toolId + '-'));
+      if (matchKey) entry = _pendingToolDecisions.get(matchKey);
+    }
+    if (entry) req.body.toolId = keys.find(k => _pendingToolDecisions.get(k) === entry) || toolId;
+  }
+  if (!entry) return res.status(404).json({ error: 'No pending decision for toolId', pending: [..._pendingToolDecisions.keys()] });
+  _pendingToolDecisions.delete(toolId);
+  try { clearTimeout(entry.timeout); } catch {}
+  entry.resolve('allow');
+  return res.json({ ok: true, toolId, decision: 'allow', via: 'api-prefix' });
+});
+
+app.post('/api/anthropic/ai/cancel-tool', (req, res) => {
+  req.url = '/anthropic/ai/cancel-tool';
+  const { toolId } = req.body || {};
+  if (!toolId) return res.status(400).json({ error: 'Missing toolId' });
+  let entry = _pendingToolDecisions.get(toolId);
+  if (!entry) {
+    const keys = [..._pendingToolDecisions.keys()];
+    if (keys.length === 1 && keys[0].startsWith(toolId + '-')) entry = _pendingToolDecisions.get(keys[0]);
+    else {
+      const matchKey = keys.find(k => k.startsWith(toolId + '-'));
+      if (matchKey) entry = _pendingToolDecisions.get(matchKey);
+    }
+    if (entry) req.body.toolId = keys.find(k => _pendingToolDecisions.get(k) === entry) || toolId;
+  }
+  if (!entry) return res.status(404).json({ error: 'No pending decision for toolId', pending: [..._pendingToolDecisions.keys()] });
+  _pendingToolDecisions.delete(toolId);
+  try { clearTimeout(entry.timeout); } catch {}
+  entry.resolve('cancel');
+  return res.json({ ok: true, toolId, decision: 'cancel', via: 'api-prefix' });
 });
 
 // Debug endpoint for local Node server: show Anthropic tool schema that would be sent

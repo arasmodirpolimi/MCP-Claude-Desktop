@@ -26,7 +26,9 @@ export async function runAnthropicStream({ prompt, model = 'claude-3-5-sonnet-la
       } else if (evt.type === 'model_used') {
         onEvent?.({ type: 'model_used', model: evt.model });
       } else if (evt.type === 'tool_use') {
-        onEvent?.({ type: 'tool_use', tool: evt.tool || evt.name, args: evt.args || evt.input || {} });
+        // Forward unique id so client can approve/cancel using exact server-side key.
+        // Anthropic may use id or tool_use_id; if absent we rely on server provided synthetic id.
+        onEvent?.({ type: 'tool_use', tool: evt.tool || evt.name, args: evt.args || evt.input || {}, id: evt.id || evt.tool_use_id });
       } else if (evt.type === 'tool_result') {
         onEvent?.({ type: 'tool_result', tool: evt.tool, output: evt.output });
       } else if (evt.type === 'tool_error') {

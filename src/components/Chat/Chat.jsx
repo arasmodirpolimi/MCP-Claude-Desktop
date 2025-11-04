@@ -75,7 +75,7 @@ const WELCOME_MESSAGE_GROUP = [
   { role: "assistant", content: "Hello! How can I assist you right now?" },
 ];
 
-export function Chat({ messages, activeServerId, activeServerName = '', onToolResult, autoRunTools = true, sessionId: externalSessionId, isLoading = false, isStreaming = false, activeToolExecs = [], toolEvents = [], userTurn = 0, onClearMemory }) {
+export function Chat({ messages, activeServerId, activeServerName = '', onToolResult, autoRunTools = true, sessionId: externalSessionId, isLoading = false, isStreaming = false, activeToolExecs = [], toolEvents = [], userTurn = 0, onClearMemory, onToolDecision }) {
   const messagesEndRef = useRef(null);
   const scrollRef = useRef(null);
   const [userNearBottom, setUserNearBottom] = useState(true);
@@ -386,7 +386,7 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
                 {role === 'user' && (
                   <div style={{ marginTop:12 }}>
                     {isLatestGroup && turn === userTurn && (
-                      <ToolActivityPanel toolEvents={toolEvents.filter(e => e.turn === userTurn)} activeToolExecs={activeToolExecs.filter(e => e.turn === userTurn)} />
+                      <ToolActivityPanel onDecision={onToolDecision} toolEvents={toolEvents.filter(e => e.turn === userTurn)} activeToolExecs={activeToolExecs.filter(e => e.turn === userTurn)} />
                     )}
                     <ToolExecutionWindows execs={activeToolExecs.filter(e => e.turn === (turn || 0) && e.status !== 'running')} />
                   </div>
@@ -419,13 +419,14 @@ export function Chat({ messages, activeServerId, activeServerName = '', onToolRe
 }
 
 /** ToolActivityPanel: shows sequential tool events and current executions; collapsible/minimizable */
-function ToolActivityPanel({ toolEvents = [], activeToolExecs = [] }) {
+function ToolActivityPanel({ toolEvents = [], activeToolExecs = [], onDecision }) {
   const [open, setOpen] = useState(true);
   const [showFinishedOutput, setShowFinishedOutput] = useState(false);
   const recent = toolEvents.slice(-40); // cap entries for performance
   const [expandedMap, setExpandedMap] = useState({}); // tool -> bool for details
   function toggleTool(t){ setExpandedMap(prev => ({ ...prev, [t]: !prev[t] })); }
   // Show only currently running executions here (finished results shown separately)
+  const pendingExecs = activeToolExecs.filter(e => e.status === 'pending');
   const runningExecs = activeToolExecs.filter(e => e.status === 'running');
   return (
     <div style={{ marginBottom:12, border:'1px solid #2a2a2a', borderRadius:8, background:'#141414', overflow:'hidden' }}>
@@ -460,6 +461,30 @@ function ToolActivityPanel({ toolEvents = [], activeToolExecs = [] }) {
               </div>
             );
           })}
+          {/* Pending approvals */}
+          {pendingExecs.length > 0 && (
+            <div style={{ marginTop:8 }}>
+              <div style={{ fontWeight:600, marginBottom:4 }}>Pending Tool Approvals</div>
+              <ul style={{ listStyle:'none', margin:0, padding:0 }}>
+                {pendingExecs.map((exec,i) => (
+                  <li key={i} style={{ border:'1px solid #1f1f1f', borderRadius:6, padding:'6px 8px', marginBottom:6, background:'#161616' }}>
+                    <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+                      <strong style={{ fontSize:'0.65rem' }}>{exec.tool}</strong>
+                      <span style={{ fontSize:'0.55rem', opacity:0.7 }}>awaiting permission</span>
+                      {exec.id && <span style={{ fontSize:'0.5rem', opacity:0.5 }}>id:{exec.id}</span>}
+                      <div style={{ display:'flex', gap:6 }}>
+                        <button onClick={()=> onDecision?.(exec.id || exec.tool, 'allow')} style={{ fontSize:'0.55rem', padding:'2px 6px', background:'#2563eb', color:'#fff', border:'1px solid #1e3a8a', borderRadius:4 }}>Allow</button>
+                        <button onClick={()=> onDecision?.(exec.id || exec.tool, 'cancel')} style={{ fontSize:'0.55rem', padding:'2px 6px', background:'#7f1d1d', color:'#fff', border:'1px solid #991b1b', borderRadius:4 }}>Cancel</button>
+                      </div>
+                    </div>
+                    {exec.args && Object.keys(exec.args).length > 0 && (
+                      <div style={{ marginTop:4, fontSize:'0.55rem', opacity:0.7 }}>Args: <code>{JSON.stringify(exec.args)}</code></div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {/* Running executions only (no finished to avoid duplication) */}
           {runningExecs.length > 0 && (
             <div style={{ marginTop:8 }}>

@@ -77,9 +77,9 @@ function AppInner() {
           } else if (evt.type === 'model_used') {
             setCurrentModel(evt.model || '');
           } else if (evt.type === 'tool_use') {
-            // Add active execution entry with turn
-            setToolEvents(prev => [...prev, { type:'use', tool: evt.tool, args: evt.args || {}, at: Date.now(), turn: nextTurn }]);
-            setActiveToolExecs(prev => [...prev.filter(e => e.tool !== evt.tool), { tool: evt.tool, startedAt: Date.now(), args: evt.args || {}, status: 'running', turn: nextTurn }]);
+            // Tool requires user approval before execution now: mark as pending
+            setToolEvents(prev => [...prev, { type:'use', tool: evt.tool, args: evt.args || {}, id: evt.id, at: Date.now(), turn: nextTurn }]);
+            setActiveToolExecs(prev => [...prev.filter(e => e.tool !== evt.tool), { tool: evt.tool, id: evt.id, startedAt: Date.now(), args: evt.args || {}, status: 'pending', turn: nextTurn }]);
           } else if (evt.type === 'tool_result') {
             setToolEvents(prev => [...prev, { type:'result', tool: evt.tool, output: evt.output, at: Date.now(), turn: nextTurn }]);
             setActiveToolExecs(prev => prev.map(e => e.tool === evt.tool ? { ...e, status: 'done', output: evt.output, finishedAt: Date.now() } : e));
@@ -96,6 +96,34 @@ function AppInner() {
       addMessage({ role:'system', content: 'Request failed: '+ String(e?.message || e) });
     } finally {
       setIsLoading(false); setIsStreaming(false); abortRef.current = null;
+    }
+  }
+
+  async function handleToolDecision(toolId, decision){
+    if (!toolId || !decision) return;
+    const primary = decision === 'allow' ? '/anthropic/ai/approve-tool' : '/anthropic/ai/cancel-tool';
+    const secondary = decision === 'allow' ? '/api/anthropic/ai/approve-tool' : '/api/anthropic/ai/cancel-tool';
+    let ok = false; let toolNameRef = toolId; let respJson = null;
+    try {
+      const r1 = await fetch((import.meta.env.VITE_API_BASE || '') + primary, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ toolId }) });
+      if (r1.ok) { ok = true; respJson = await r1.json().catch(()=>null); }
+      else {
+        const r2 = await fetch((import.meta.env.VITE_API_BASE || '') + secondary, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ toolId }) });
+        if (r2.ok) { ok = true; respJson = await r2.json().catch(()=>null); }
+        else {
+          // Capture body for diagnostics
+          let txt=''; try { txt = await r2.text(); } catch {}
+          setToolEvents(prev => [...prev, { type:'error', tool: toolNameRef, error:`Decision failed (${r1.status}/${r2.status}) ${txt.slice(0,140)}`, at: Date.now(), turn: userTurn }]);
+        }
+      }
+      if (ok) {
+        setActiveToolExecs(prev => prev.map(e => e.id === toolId ? { ...e, status: decision === 'allow' ? 'running' : 'canceled' } : e));
+        if (decision === 'cancel') {
+          setToolEvents(prev => [...prev, { type:'error', tool: prev.find(p => p.id === toolId)?.tool || toolNameRef, error:'User canceled tool', at: Date.now(), turn: userTurn }]);
+        }
+      }
+    } catch (e) {
+      setToolEvents(prev => [...prev, { type:'error', tool: toolId, error:'Decision endpoint failed: '+ String(e?.message || e), at: Date.now(), turn: userTurn }]);
     }
   }
 
@@ -174,6 +202,7 @@ function AppInner() {
             userTurn={userTurn}
             autoRunTools={true}
             onClearMemory={clearMessages}
+            onToolDecision={handleToolDecision}
           />
         </div>
       </div>
