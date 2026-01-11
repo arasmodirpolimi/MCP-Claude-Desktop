@@ -1,7 +1,7 @@
 // server.js
 // Make sure your package.json has: { "type": "module" }
 
-import "dotenv/config";
+import dotenv from "dotenv";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
@@ -10,6 +10,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   registerTools,
   TOOL_DEFS,
@@ -25,6 +26,28 @@ import { z } from "zod";
 import cors from "cors";
 
 const SEP = "---";
+// Resolve file and directory paths in ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
+// Load environment variables from a robust .env path (prefer project root)
+try {
+  const primaryEnv = path.join(PROJECT_ROOT, ".env");
+  const cwdEnv = path.join(process.cwd(), ".env");
+  let usedPath = null;
+  try { await fs.access(primaryEnv); usedPath = primaryEnv; } catch {}
+  if (!usedPath) { try { await fs.access(cwdEnv); usedPath = cwdEnv; } catch {} }
+  if (usedPath) {
+    dotenv.config({ path: usedPath });
+    console.log("[env] Loaded .env from", usedPath);
+  } else {
+    dotenv.config();
+    console.log("[env] No .env found; relying on process environment");
+  }
+} catch (e) {
+  dotenv.config();
+  console.warn("[env] dotenv load error; using defaults:", e?.message || e);
+}
 function createServer() {
   const server = new McpServer({
     name: "weather-server",
@@ -38,7 +61,22 @@ function createServer() {
 const app = express();
 // Helper to spawn servers from config file; re-loadable
 async function spawnServersFromConfig({ replace = false } = {}) {
-  const cfgPath = path.join(process.cwd(), "mcpServers.json");
+  // Try multiple locations to find mcpServers.json: explicit env, CWD, project root
+  const candidatePaths = [];
+  if (process.env.MCP_SERVERS_PATH && process.env.MCP_SERVERS_PATH.trim()) {
+    candidatePaths.push(path.resolve(process.env.MCP_SERVERS_PATH.trim()));
+  }
+  candidatePaths.push(path.join(process.cwd(), "mcpServers.json"));
+  candidatePaths.push(path.join(PROJECT_ROOT, "mcpServers.json"));
+
+  let cfgPath = null;
+  for (const p of candidatePaths) {
+    try { await fs.access(p); cfgPath = p; break; } catch {}
+  }
+  if (!cfgPath) {
+    console.log("[MCP] No mcpServers.json found; skipping auto-spawn");
+    return { ok: true, loaded: 0 };
+  }
   const raw = await fs.readFile(cfgPath, "utf8").catch(() => null);
   if (!raw) {
     console.log("[MCP] No mcpServers.json found; skipping auto-spawn");
@@ -375,8 +413,8 @@ async function spawnServersFromConfig({ replace = false } = {}) {
                   if (!t?.name) continue;
                   const baseName = t.name;
                   let finalName = baseName;
-                  // Avoid name collision: if already exists, namespace with server name
-                  if (TOOL_DEFS[finalName]) finalName = `${name}:${baseName}`;
+                  // Avoid name collision: if already exists, namespace with server name using dot (.) per MCP naming rules
+                  if (TOOL_DEFS[finalName]) finalName = `${name}.${baseName}`;
                   if (TOOL_DEFS[finalName]) continue; // still collision, skip
                   const rawSchema = t.input_schema || t.inputSchema || { type: 'object', properties: {} };
                   const props = rawSchema.properties || {};
@@ -467,7 +505,8 @@ async function bridgeExternalTools(stdioClient, serverEntry, name) {
       if (!t?.name) continue;
       const baseName = t.name;
       let finalName = baseName;
-      if (TOOL_DEFS[finalName]) finalName = `${name}:${baseName}`; // namespace to avoid collision
+      // Use dot (.) for namespacing to comply with MCP tool name spec
+      if (TOOL_DEFS[finalName]) finalName = `${name}.${baseName}`; // namespace to avoid collision
       if (TOOL_DEFS[finalName]) continue; // still collision
       const rawSchema = t.input_schema || t.inputSchema || { type: 'object', properties: {} };
       const props = rawSchema.properties || {};
@@ -1649,6 +1688,8 @@ app.post("/anthropic/chat", async (req, res) => {
 // Emits structured events: model_used, tool_use, tool_result, tool_error, assistant_text, done
 // Strategy: iterative non-stream Anthropic calls to capture tool_use blocks; final answer streamed in chunks.
 app.post("/anthropic/ai/chat-stream", async (req, res) => {
+  
+  console.log("[Anthropic Chat Stream] new request", process.env.ANTHROPIC_API_KEY);
   const apiKey = process.env.ANTHROPIC_API_KEY;
   const {
     prompt,
@@ -1826,16 +1867,8 @@ ${forceEnable2 ? 'You currently have access to the following runtime tools (enum
     // No tool uses: finalize with text
     if (textBlocks.length) {
       finalText = textBlocks.map((tb) => tb.text).join("\n");
-      // Stream in pseudo-chunks for client consistency
-      const chunkSize = 200;
-      let i = 0;
-      while (i < finalText.length) {
-        send({
-          type: "assistant_text",
-          text: finalText.slice(i, i + chunkSize),
-        });
-        i += chunkSize;
-      }
+      // Send a single consolidated assistant_text event for clarity
+      send({ type: "assistant_text", text: finalText });
       break;
     } else {
       // If no text and no tools, we are done

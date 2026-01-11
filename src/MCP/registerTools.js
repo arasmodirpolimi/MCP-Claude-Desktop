@@ -46,7 +46,11 @@ export function removeToolsByOrigin(originName) {
   if (!originName) return 0;
   let removed = 0;
   for (const [name, def] of Object.entries(TOOL_DEFS)) {
-    if (def?.__origin === originName || (name.startsWith(originName + ':'))) {
+    if (
+      def?.__origin === originName ||
+      name.startsWith(originName + ':') ||
+      name.startsWith(originName + '.')
+    ) {
       delete TOOL_DEFS[name];
       removed++;
     }
